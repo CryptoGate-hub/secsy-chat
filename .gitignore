@@ -1,0 +1,14 @@
+# Environnement
+.venv/
+venv/
+virtual/
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+
+# Données locales : ne JAMAIS commiter (clés privées, base, logs, profils)
+*.key
+*.db
+*.log
+*.json

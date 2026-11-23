@@ -1,0 +1,10 @@
+argon2-cffi
+pycryptodomex
+jsonschema
+
+# Assistant IA (optionnel) : sans ces paquets, l'IA se désactive toute seule
+google-genai
+pypdf
+python-docx
+
+# Interface TUI : fournie par HELMo (paquet "secsychat-tui"), à installer séparément — voir README.md
