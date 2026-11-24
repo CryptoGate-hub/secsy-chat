@@ -1,4 +1,4 @@
-import logging, threading, json, base64, time, re
+import logging, logging.handlers, threading, json, base64, time, re
 from common import database, network, security, data
 from common.exchange import ExchangeType
 from common.message import parse_message
@@ -12,7 +12,8 @@ RESERVED_NAMES = {"whitehat-ai", "whitehat-ai_2", "système", "systeme", "system
 logging.basicConfig(
     level=logging.DEBUG,     # DEBUG, INFO, WARNING et ERROR sont tous utilisés dans ce fichier
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    handlers=[logging.FileHandler("server.log", encoding='utf-8'), logging.StreamHandler()]
+    handlers=[logging.handlers.RotatingFileHandler("server.log", maxBytes=1_000_000, backupCount=3, encoding='utf-8'),
+              logging.StreamHandler()]
 )
 logger = logging.getLogger("Server")
 
@@ -30,6 +31,8 @@ MAX_CIPHER_LEN   = 16 * 1024     # taille maximale du texte chiffré (base64) d'
                                  # géant rende l'historique d'un canal impossible à recevoir pour les autres
 MAX_KEY_LEN      = 1024          # taille maximale de la clé chiffrée d'un message (RSA-2048 : ~344 caractères)
 MSG_BURST, MSG_WINDOW = 10, 10   # au plus 10 messages toutes les 10 secondes par connexion
+MAX_CHANNEL_CREATIONS, CHANNEL_WINDOW = 5, 60      # canaux créés par utilisateur et par minute (chacun coûte une paire RSA)
+MAX_NEW_ACCOUNTS, NEW_ACCOUNT_WINDOW = 10, 600     # comptes créés par adresse IP en 10 minutes
 
 # Identité du serveur : sa clé privée (server.key) signe chaque Diffie-Hellman.
 # server.pub est la clé publique à donner aux clients (ils la vérifient avant d'envoyer
@@ -47,6 +50,20 @@ _failed      = {}                 # ("user", pseudo) ou ("ip", adresse) -> [nomb
 _failed_lock = threading.Lock()
 _conn_per_ip = {}                 # adresse IP -> connexions ouvertes
 _conn_lock   = threading.Lock()
+_new_accounts      = {}            # adresse IP -> horodatages des comptes créés récemment
+_new_accounts_lock = threading.Lock()
+
+
+def _new_account_allowed(ip: str) -> bool:
+    """Limite la création de comptes depuis une même adresse IP (chaque compte = un hachage Argon2)."""
+    now = time.time()
+    with _new_accounts_lock:
+        recent = [t for t in _new_accounts.get(ip, []) if now - t < NEW_ACCOUNT_WINDOW]
+        if len(recent) >= MAX_NEW_ACCOUNTS:
+            _new_accounts[ip] = recent
+            return False
+        _new_accounts[ip] = recent + [now]
+        return True
 
 
 def create_default_channels():
@@ -149,6 +166,9 @@ def _handshake(conn, addr) -> tuple:
         logger.info(f"Connexion de {pseudo} (compte existant)")
     else:
         # Premier échange : le compte est créé, le mot de passe est stocké haché (Argon2)
+        if not _new_account_allowed(addr[0]):
+            network.send_message(conn, b"AUTH_FAIL")
+            raise PermissionError(f"Trop de créations de compte depuis {addr[0]}")
         user_id = security.generate_id()
         data.create_user(user_id, pseudo, security.argon2_hash_password(pwd))
         logger.info(f"Nouveau compte créé : {pseudo}")
@@ -320,6 +340,11 @@ def _handle_statement(conn, info: dict, payload: bytes):
                 return _error(conn, info, f"Le canal '{ch_name}' existe déjà")
             if ch_pass and len(ch_pass) < 6:
                 return _error(conn, info, "Le mot de passe du canal doit faire au moins 6 caractères.")
+            now    = time.time()
+            recent = [t for t in info.get("chan_times", []) if now - t < CHANNEL_WINDOW]
+            if len(recent) >= MAX_CHANNEL_CREATIONS:
+                return _error(conn, info, "Trop de canaux créés : attends un peu avant d'en créer un autre")
+            info["chan_times"] = recent + [now]
 
             ch_id = security.generate_id()
             priv_k, pub_k = security.generate_rsa_keypair()

@@ -33,7 +33,7 @@
 | Intégrité et authenticité | Somme **SHA-256** (émetteur, destinataire, horodatage, charge) signée en **RSA**, vérifiée par le serveur **et** le destinataire |
 | Authentification | Mot de passe **+** signature RSA d'un horodatage (clé publique enregistrée à la première connexion) ; **essais limités** (5 par pseudo, puis attente croissante) |
 | Protocole | En-tête de 11 octets, schémas **JSON Schema** pour chaque message, instruction et évènement |
-| Limites anti-abus | Taille d'un message plafonnée (16 Ko chiffré), 10 messages / 10 s par connexion, essais de mot de passe de canal limités, 10 connexions max par IP |
+| Limites anti-abus | Taille d'un message plafonnée (16 Ko chiffré), 10 messages / 10 s par connexion, 5 canaux créés / minute par utilisateur, 10 comptes créés / 10 min par IP, essais de mot de passe de canal limités, 10 connexions max par IP |
 
 **Ce que le serveur peut lire.** Les messages privés sont chiffrés avec la clé publique du destinataire : le serveur ne peut pas les lire tant qu'il fournit la bonne clé (voir les limites connues). Les messages de canal sont chiffrés avec la clé du canal, que le serveur génère, stocke et distribue aux membres (c'est le schéma imposé par l'énoncé) : le serveur *peut* donc les déchiffrer. Dans les deux cas, il vérifie les signatures avant de stocker et de relayer.
 Détails : [docs/PROTOCOLE.md](docs/PROTOCOLE.md). Limites connues et écarts : fin de [docs/AUDIT_SECURITE.md](docs/AUDIT_SECURITE.md).
@@ -95,6 +95,8 @@ secsy-chat/
 ├── server.py          # Serveur TCP multi-thread
 ├── client.py          # Client TUI
 ├── ai_assistant.py    # Assistant IA Gemini (optionnel)
+├── tests/             # Tests de sécurité de bout en bout (serveur réel + clients sans interface)
+├── LICENSE            # Licence MIT
 ├── common/
 │   ├── security.py    # Cryptographie (Argon2, DH, AES-GCM, ChaCha20, RSA, SHA-256, NanoId)
 │   ├── network.py     # Sockets : en-tête de 11 octets
@@ -112,6 +114,13 @@ Mets ta clé (gratuite : https://aistudio.google.com/api-keys) dans un fichier `
 
 Sans clé, l'IA se désactive toute seule et le client explique pourquoi. Pour la couper définitivement : `AI_ENABLED = False` dans `ai_assistant.py`.
 
+## Tests
+
+```powershell
+python tests/test_securite.py
+```
+Le script lance un vrai serveur dans un dossier temporaire (port 4000 libre requis) et rejoue les attaques corrigées pendant l'audit : rejeu de trames, essais de mot de passe de canal, message géant, rafale de messages, kick, création en masse. Environ une minute ; un `FAIL` signifie qu'une protection a régressé.
+
 ## Limites connues
 
-Projet pédagogique, à ne pas utiliser en production. En particulier : le client ne mémorise pas les clés publiques des autres utilisateurs d'une session à l'autre : un serveur malveillant pourrait donc fournir sa propre clé à la place de celle d'un destinataire et lire un message privé (même principe qu'un serveur Signal sans vérification des numéros de sécurité) ; le serveur détient la clé privée de chaque canal (schéma imposé par l'énoncé) et peut donc lire les messages de canal ; et si un PC se connecte pour la toute première fois à travers un attaquant **sans** avoir `server.pub`, il enregistre la mauvaise clé (comme avec SSH). Liste complète dans [docs/AUDIT_SECURITE.md](docs/AUDIT_SECURITE.md).
+Projet pédagogique, à ne pas utiliser en production. En particulier : le client ne mémorise pas les clés publiques des autres utilisateurs d'une session à l'autre : un serveur malveillant pourrait donc fournir sa propre clé à la place de celle d'un destinataire et lire un message privé (même principe qu'un serveur Signal sans vérification des numéros de sécurité) ; le serveur détient la clé privée de chaque canal (schéma imposé par l'énoncé) et peut donc lire les messages de canal ; et si un PC se connecte pour la toute première fois à travers un attaquant **sans** avoir `server.pub`, il enregistre la mauvaise clé (comme avec SSH). Pas de confidentialité persistante pour les messages : quelqu'un qui obtient `<pseudo>.key` peut déchiffrer les messages privés qu'il aurait enregistrés avant (schéma RSA + clé par message imposé par l'énoncé ; le transport, lui, utilise des clés éphémères). Ce fichier est stocké en clair (`chmod 600` n'a pas d'effet sous Windows). Liste complète dans [docs/AUDIT_SECURITE.md](docs/AUDIT_SECURITE.md).

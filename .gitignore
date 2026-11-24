@@ -11,5 +11,6 @@ __pycache__/
 *.key
 *.db
 *.log
+*.log.*
 *.json
 server.pub
