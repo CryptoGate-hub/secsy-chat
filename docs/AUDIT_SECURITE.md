@@ -30,11 +30,17 @@ exécutés : 29/29 puis 12/12 vérifications réussies.
   `u_` / `c_` / `pm_` + hexadécimal.
 
 **Intégrité et E2EE (it. 5, 7, 8)**
-- Avant, le destinataire signé d'un message de canal était `"current"` : un message
-  signé pour un canal pouvait être rejoué dans un autre. Le **vrai canal (id + nom)
-  est maintenant signé**, et le serveur vérifie qu'il correspond au canal de l'émetteur.
-- Le serveur vérifie que l'**émetteur annoncé est bien l'utilisateur authentifié**
-  (sinon Alice pouvait signer un message « de la part de Bob »).
+- **Usurpation d'identité (démontrée sur la version rendue).** Le serveur vérifiait la signature avec la clé de
+  l'utilisateur connecté, mais ne comparait jamais le nom d'émetteur écrit *dans* le message à cet utilisateur, et le
+  client d'origine ne vérifiait que le checksum (que n'importe qui peut recalculer) avant d'afficher ce nom.
+  Résultat testé : Alice envoie un message signé avec sa propre clé en écrivant « bobby » comme émetteur ; Carol voit
+  « bobby ». Corrigé : le serveur refuse tout message dont l'émetteur annoncé (id + nom) n'est pas l'utilisateur
+  authentifié, et le client vérifie la signature avec la clé publique de l'émetteur.
+- **Signature non liée au canal (impact limité).** Le destinataire signé d'un message de canal était `"current"`
+  au lieu du vrai canal. Seul l'auteur pouvait rejouer son propre message, et sa charge reste chiffrée pour la clé du
+  canal d'origine : ce n'est donc pas une attaque exploitable en pratique, mais la signature ne disait pas à qui
+  le message était destiné. Le **vrai canal (id + nom) est maintenant signé**, et le serveur vérifie qu'il
+  correspond au canal de l'émetteur.
 - Le calcul du checksum est **une seule fonction partagée** (`security.message_checksum`)
   utilisée par le client et le serveur : ils ne peuvent plus diverger.
 - Le **client vérifie aussi** checksum + signature à la réception, y compris pour
