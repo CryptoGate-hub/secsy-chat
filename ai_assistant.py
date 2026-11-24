@@ -35,6 +35,8 @@ AI_ENABLED = True
 
 AI_WARNING = "⚠️ Ce qui est envoyé à l'IA part en clair chez Google (hors chiffrement). Rien de confidentiel."
 AI_DISABLED_REASON = "désactivée (AI_ENABLED = False dans ai_assistant.py)."
+# Extensions de fichiers que /ia2 refuse d'envoyer (clés RSA, clé Gemini, base de données, logs)
+SENSITIVE_EXT = (".key", ".pem", ".db", ".log")
 
 
 def _load_api_key() -> str:
@@ -116,6 +118,10 @@ def ask_ai(question: str = "", fichiers: list = None, mode: str = "normal") -> s
                     if not os.path.exists(fichier):
                         file_contents.append(f"--- FICHIER : {fichier} ---\n[Erreur : Fichier introuvable]")
                         continue
+                    if fichier.lower().endswith(SENSITIVE_EXT):
+                        # Clés privées, base de données... : ne partent JAMAIS chez Google, même sur demande
+                        file_contents.append(f"--- FICHIER : {fichier} ---\n[Refusé : fichier sensible]")
+                        continue
 
                     ext = fichier.lower()
 
@@ -174,7 +180,7 @@ def ask_ai(question: str = "", fichiers: list = None, mode: str = "normal") -> s
             if mode == "pro":
                 logger.warning("Rate limit Pro atteint → fallback sur Flash")
                 return ask_ai(question=question, fichiers=fichiers, mode="normal")
-            return "❌ **Rate limit Gemini atteint** (429). Attends 30-60 secondes et réessaie."
+            return "❌ Rate limit Gemini atteint (429). Attends 30-60 secondes et réessaie."
 
         if "500" in error_str or "internal" in error_str or "unavailable" in error_str or "503" in error_str:
             logger.error(f"Erreur serveur Gemini ({mode}) : {e}")
