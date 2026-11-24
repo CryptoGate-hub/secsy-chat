@@ -27,10 +27,11 @@
 |---|---|
 | Mots de passe | Hachage **Argon2** côté serveur |
 | Clé de transport | **Diffie-Hellman** (groupe RFC 3526, 2048 bits), établi *avant* tout identifiant |
-| Transport client ↔ serveur | **AES-256-GCM** (le type d'échange est authentifié par GCM) |
+| Identité du serveur | Le serveur **signe le Diffie-Hellman** avec sa clé RSA (`server.key`) ; le client vérifie avec `server.pub` avant d'envoyer son mot de passe |
+| Transport client ↔ serveur | **AES-256-GCM** ; type d'échange, sens et **numéro de trame** authentifiés (une trame rejouée est refusée) |
 | Contenu des messages | Clé **ChaCha20-Poly1305** unique par message, chiffrée avec la clé publique **RSA-2048** du destinataire |
 | Intégrité et authenticité | Somme **SHA-256** (émetteur, destinataire, horodatage, charge) signée en **RSA**, vérifiée par le serveur **et** le destinataire |
-| Authentification | Mot de passe **+** signature RSA d'un horodatage (clé publique enregistrée à la première connexion) |
+| Authentification | Mot de passe **+** signature RSA d'un horodatage (clé publique enregistrée à la première connexion) ; **essais limités** (5 par pseudo, puis attente croissante) |
 | Protocole | En-tête de 11 octets, schémas **JSON Schema** pour chaque message, instruction et évènement |
 
 **Ce que le serveur peut lire.** Les messages privés sont chiffrés avec la clé publique du destinataire : le serveur ne peut pas les lire. Les messages de canal sont chiffrés avec la clé du canal, que le serveur génère, stocke et distribue aux membres (c'est le schéma imposé par l'énoncé) : le serveur *peut* donc les déchiffrer. Dans les deux cas, il vérifie les signatures avant de stocker et de relayer.
@@ -47,6 +48,8 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # Linux / macOS : source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+> Sous Windows, si `pip` est bloqué (« Une stratégie de contrôle d'application a bloqué ce fichier »), utilise `python -m pip install -r requirements.txt`.
 
 **Interface TUI.** Le client utilise la bibliothèque `secsychat-tui` fournie par HELMo dans le cadre du cours (elle n'est pas redistribuée ici). Installe-la depuis la source fournie par l'école :
 
@@ -66,6 +69,8 @@ python client.py 127.0.0.1 4000 alice
 python client.py 127.0.0.1 4000 bobby
 ```
 
+Au premier démarrage, le serveur crée sa clé d'identité `server.key` (à garder secrète) et écrit `server.pub`, puis affiche son **empreinte**. Un client lancé dans le même dossier la trouve tout seul. Sur un autre PC, copie `server.pub` à côté de `client.py` ; sinon, à la première connexion, le client enregistre la clé reçue et affiche son empreinte : compare-la à celle du serveur (même principe que SSH).
+
 À la **première connexion** d'un pseudo (3 à 20 caractères : lettres, chiffres, `_`, `-`, `.`), une paire de clés RSA est créée dans `<pseudo>.key` et le compte est créé avec le mot de passe saisi (8 caractères minimum, sans écho).
 Conserve ton fichier `.key` : sans lui, le compte n'est plus accessible (voulu). Ne le partage jamais et ne le commite jamais (il est dans le `.gitignore`).
 
@@ -74,11 +79,11 @@ Conserve ton fichier `.key` : sans lui, le compte n'est plus accessible (voulu).
 | Commande | Effet |
 |---|---|
 | `/commands` | Liste des commandes |
-| `/users`, `/status` | Utilisateurs connectés, canal actif |
+| `/users` (`/who`), `/status` (`/where`) | Utilisateurs connectés, canal actif |
 | `/create <nom> [mdp]` | Crée un canal (privé si un mot de passe est donné, 6 caractères minimum) |
 | `/join <nom> [mdp]` | Rejoint un canal |
 | `/leave` | Quitte le canal actuel (retour dans `#general`) |
-| `/kick <pseudo> [secondes]` | Expulse un membre (créateur du canal uniquement) |
+| `/kick <canal> <membre> [secondes]` | Expulse un membre : définitivement, ou pour une durée (créateur du canal uniquement) |
 | `/delete <nom>` | Supprime un canal (créateur uniquement) |
 | `/pm <pseudo> <message>` | Message privé chiffré de bout en bout |
 
@@ -100,14 +105,12 @@ secsy-chat/
 
 ## Assistant IA (optionnel)
 
-`/ia <question>` et `/ia pro <question>` interrogent Gemini. **Attention : ce message part en clair vers Google et sort donc du chiffrement de bout en bout.** Le client l'indique avant le premier usage, et seul le message adressé à l'IA est envoyé (jamais l'historique du canal).
+`/ia <question>`, `/ia pro <question>` et `@whitehat <question>` interrogent Gemini (`/ia2 <fichiers> [consigne]` analyse des fichiers). Un message normal n'est **jamais** envoyé à l'IA. **Attention : ce message part en clair vers Google et sort donc du chiffrement de bout en bout.** Le client l'indique avant le premier usage, et seul le message adressé à l'IA est envoyé (jamais l'historique du canal).
 
-```powershell
-$env:GEMINI_API_KEY = "ta_clé"    # clé gratuite : https://aistudio.google.com/api-keys
-```
+Mets ta clé (gratuite : https://aistudio.google.com/api-keys) dans un fichier `gemini.key` à côté de `client.py`, ou dans la variable d'environnement `GEMINI_API_KEY`. Le fichier est ignoré par git (`*.key`) : la clé n'est jamais publiée.
 
-Sans clé, l'IA se désactive toute seule. Pour la couper définitivement : `AI_ENABLED = False` dans `ai_assistant.py`.
+Sans clé, l'IA se désactive toute seule et le client explique pourquoi. Pour la couper définitivement : `AI_ENABLED = False` dans `ai_assistant.py`.
 
 ## Limites connues
 
-Projet pédagogique, à ne pas utiliser en production. En particulier : Diffie-Hellman non authentifié (attaque de l'homme du milieu active possible), pas de limitation des essais de mot de passe, et une instruction de l'énoncé (`UPDATE_USER`) non implémentée. Liste complète dans [docs/AUDIT_SECURITE.md](docs/AUDIT_SECURITE.md).
+Projet pédagogique, à ne pas utiliser en production. En particulier : le serveur détient la clé privée de chaque canal (schéma imposé par l'énoncé) et peut donc lire les messages de canal ; et si un PC se connecte pour la toute première fois à travers un attaquant **sans** avoir `server.pub`, il enregistre la mauvaise clé (comme avec SSH). Liste complète dans [docs/AUDIT_SECURITE.md](docs/AUDIT_SECURITE.md).
