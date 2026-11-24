@@ -33,37 +33,77 @@ logger = logging.getLogger("Client")
 # mettre AI_ENABLED = False. Rien d'autre à changer.
 AI_ENABLED = True
 
-AI_WARNING = (
-    "⚠️  Un message envoyé à l'IA (WhiteHat-AI) part en clair vers les serveurs "
-    "de Google (Gemini) et sort donc du chiffrement de bout en bout de Secsy Chat. "
-    "N'y mets rien de confidentiel."
-)
+AI_WARNING = "⚠️ Ce qui est envoyé à l'IA part en clair chez Google (hors chiffrement). Rien de confidentiel."
+AI_DISABLED_REASON = "désactivée (AI_ENABLED = False dans ai_assistant.py)."
 
-try:
-    import google.genai as genai
-    # La clé n'est JAMAIS écrite dans le code : elle vient de la variable d'environnement GEMINI_API_KEY
-    # (PowerShell : $env:GEMINI_API_KEY = "ta_clé" ; clé gratuite : https://aistudio.google.com/api-keys)
-    _client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-except Exception as e:  # SDK absent, variable GEMINI_API_KEY absente, etc. → on désactive proprement
-    logger.warning(f"Assistant IA indisponible ({e}) — fonctionnalité désactivée")
-    AI_ENABLED = False
-    _client = None
+
+def _load_api_key() -> str:
+    """La clé n'est JAMAIS écrite dans le code. Elle vient, dans l'ordre :
+    1. de la variable d'environnement GEMINI_API_KEY ;
+    2. du fichier gemini.key à côté du client (ignoré par git, comme tous les *.key).
+    Clé gratuite : https://aistudio.google.com/api-keys"""
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key and os.path.exists("gemini.key"):
+        key = open("gemini.key", encoding="utf-8").read().strip()
+    return key
+
+
+_client = None
+if AI_ENABLED:
+    try:
+        import google.genai as genai
+        _key = _load_api_key()
+        if not _key:
+            AI_DISABLED_REASON = "aucune clé. Mets-la dans le fichier gemini.key ou dans GEMINI_API_KEY."
+            raise RuntimeError("clé Gemini absente")
+        _client = genai.Client(api_key=_key)
+    except ImportError:
+        AI_DISABLED_REASON = "paquet google-genai absent (pip install -r requirements.txt)."
+    except Exception as e:
+        if AI_DISABLED_REASON.startswith("désactivée"):
+            AI_DISABLED_REASON = f"erreur au démarrage ({e})."
+    if _client is None:
+        logger.warning(f"Assistant IA indisponible : {AI_DISABLED_REASON}")
+        AI_ENABLED = False
+
+
+# Modèles essayés dans l'ordre : Google réserve les modèles 2.5 aux comptes qui les utilisaient
+# déjà, une nouvelle clé doit donc passer par les modèles récents.
+MODELS = {
+    "normal": ["gemini-3.8-flash", "gemini-2.5-flash"],
+    "pro":    ["gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-3.8-flash"],
+}
+
+
+def _generate(models: list, contents: list):
+    """Essaie chaque modèle ; passe au suivant seulement si celui-ci est introuvable ou non autorisé."""
+    for i, model_name in enumerate(models):
+        try:
+            return _client.models.generate_content(model=model_name, contents=contents)
+        except Exception as e:
+            err = str(e).lower()
+            unavailable = any(w in err for w in ("404", "not found", "not_found", "permission", "403"))
+            if not unavailable or i == len(models) - 1:
+                raise
+            logger.warning(f"Modèle {model_name} indisponible, essai du suivant")
 
 
 def ask_ai(question: str = "", fichiers: list = None, mode: str = "normal") -> str:
     """mode = normal (Flash) ou pro. Ne renvoie QUE le texte de réponse (ou un message d'erreur)."""
     if not AI_ENABLED or _client is None:
-        return "❌ Assistant IA désactivé sur ce client."
+        return f"❌ IA indisponible : {AI_DISABLED_REASON}"
 
     try:
-        model_name = "gemini-2.5-pro" if mode == "pro" else "gemini-2.5-flash"
 
+        # La TUI affiche du texte brut : pas de Markdown, et des réponses courtes pour un chat
+        format_rules = ("Réponds en français, en texte brut : pas de Markdown (ni astérisques, ni #, "
+                        "ni tableaux). Va droit au but. Utilise des tirets simples pour une liste.")
         system_prompt = (
-            "Tu es WhiteHat-AI 2.0 Pro, une IA experte, très précise, créative et rigoureuse. "
-            "Réponds de façon détaillée, structurée et professionnelle en français."
+            "Tu es WhiteHat-AI Pro, un expert précis et rigoureux. Réponse structurée, 15 lignes maximum. "
+            + format_rules
         ) if mode == "pro" else (
-            "Tu es WhiteHat-AI, un assistant IA intelligent, sympa, créatif et très compétent. "
-            "Réponds en français de façon claire, structurée et utile."
+            "Tu es WhiteHat-AI, un assistant de messagerie sympa et compétent. Réponse courte, 6 lignes maximum. "
+            + format_rules
         )
 
         contents = [system_prompt]
@@ -123,8 +163,9 @@ def ask_ai(question: str = "", fichiers: list = None, mode: str = "normal") -> s
         else:
             contents.append("Bonjour")
 
-        response = _client.models.generate_content(model=model_name, contents=contents)
-        return response.text.strip()
+        response = _generate(MODELS["pro" if mode == "pro" else "normal"], contents)
+        # Filet de sécurité si le modèle met quand même du Markdown
+        return response.text.replace("**", "").replace("__", "").strip()
 
     except Exception as e:
         error_str = str(e).lower()
