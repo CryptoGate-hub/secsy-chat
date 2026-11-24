@@ -6,6 +6,44 @@ qui a été changé. Fichiers concernés indiqués entre parenthèses.
 
 ---
 
+## Partie C — Deuxième audit : failles démontrées puis corrigées (24/11/2026)
+
+Méthode : le vrai `server.py` a été lancé, avec des clients sans interface qui réutilisent les
+fonctions de `client.py`. Chaque faille a d'abord été **reproduite**, puis corrigée, puis le même
+test a été relancé pour vérifier qu'elle ne se reproduit plus (11/11 tests réussis, plus l'attaque
+de l'homme du milieu).
+
+| # | Faille | Preuve avant correction | Correction | Fichiers |
+|---|---|---|---|---|
+| 1 | **Diffie-Hellman non authentifié** (critique) | Un faux serveur intermédiaire a obtenu le pseudo et le mot de passe en clair, puis la clé privée de #general | Le serveur signe les deux clés DH de la session avec sa clé d'identité (`server.key`) ; le client vérifie avec `server.pub` **avant** d'envoyer ses identifiants | `security.py`, `server.py`, `client.py` |
+| 2 | **Rejeu de trames** | Une trame « virement validé » renvoyée telle quelle : reçue et stockée 2 fois | Numéro de trame par sens dans l'AAD d'AES-GCM (`TransportCipher`) ; une trame rejouée coupe la connexion | `security.py`, `server.py`, `client.py` |
+| 3 | **Kick « permanent » sans effet** | Bob refaisait `/join` juste après son kick | Table `channel_ban` vérifiée à chaque `JOIN_CHANNEL` (temporaire ou permanent, survit au redémarrage) | `database.py`, `data.py`, `server.py` |
+| 4 | **Essais de mot de passe illimités** | 30 mauvais mots de passe d'affilée, aucun blocage | 5 échecs par pseudo (20 par IP) puis attente de 30 s, 60 s, 120 s… (15 min max) ; réponse `AUTH_FAIL` identique dans tous les cas | `server.py` |
+| 5 | **Horodatage des messages libre** | Un message daté de 2099 restait épinglé dans l'historique | Refus au-delà de ±5 min (`MAX_CLOCK_DRIFT`, déjà utilisé à la connexion) | `server.py` |
+| 6 | **Pseudos sensibles à la casse** | `bob` créé alors que `Bob` existait | Création refusée si un pseudo identique à la casse près existe | `data.py`, `server.py` |
+| 7 | **Aucun délai d'expiration** | 50 connexions muettes gardées ouvertes, un thread chacune | 15 s pour terminer la poignée de main, 10 connexions simultanées max par IP | `server.py` |
+| 8 | **Messages de canal envoyés à Gemini par erreur** | « Je pense que le problème vient du proxy via… » partait chez Google (« pro » + « ia ») | Seuls `/ia`, `/ia pro`, `/ia2` et un message qui **commence** par `@whitehat` vont à l'IA | `client.py` |
+| 9 | **SQLite partagée sans verrou** | Constaté à la lecture | Verrou unique autour de chaque requête | `database.py` |
+| 10 | **Nom d'un canal privé diffusé** | Un non-membre recevait « projet-secret » à la suppression | `CHANNEL_DELETED` d'un canal privé envoyé à ses seuls membres | `server.py` |
+| 11 | **`/ia pro` jamais en mode Pro** | `/ia ` testé avant `/ia pro ` | Ordre des tests inversé | `client.py` |
+
+**Conformité à l'énoncé, ajoutée au passage**
+- `/kick <canal> <membre> [secondes]` (avant : `/kick <pseudo>` sur le canal courant).
+- Instruction `UPDATE_USER` : le client signale son activité (au plus une fois par minute), le serveur
+  met à jour `last_activity_at` et diffuse l'évènement `USER_UPDATED` (au plus un toutes les 30 s par utilisateur).
+
+**Documentation corrigée** : commentaire du groupe DH (c'est bien le groupe 14, 2048 bits), 20 et non
+30 messages d'historique, commandes `/kick` et `/commands`, exemple d'instruction avec `timestamp`,
+verrous réellement présents. `server.pub` (généré) ajouté au `.gitignore`.
+
+**Choix volontairement non faits (pour garder l'idée de base)**
+- La clé d'un canal n'est **pas** renouvelée après un kick : les anciens messages, chiffrés avec
+  l'ancienne clé, deviendraient illisibles dans l'historique. Le serveur ne renvoie de toute façon plus
+  rien à l'expulsé.
+- Pas de commande pour lever une expulsion permanente (l'énoncé n'en demande pas).
+
+---
+
 ## Partie B — Mise en conformité avec la checklist (audit des 90 critères)
 
 Après les corrections 1 à 5 ci-dessous, le code a été relu critère par critère
@@ -73,15 +111,15 @@ exécutés : 29/29 puis 12/12 vérifications réussies.
   `google-genai` (le code importe `google.genai`). README mis à jour.
 
 **Écarts restants, à connaître pour la défense**
-- `UPDATE_USER` (notifier l'activité) n'est pas implémenté ; les évènements `CHANNEL_LIST`
-  et `UPDATED_USERS` renvoient une liste au lieu d'un évènement par canal / utilisateur
-  (`CHANNEL_CREATED` / `USER_UPDATED` de l'énoncé).
-- `/kick <pseudo> [secondes]` agit sur le canal courant (l'énoncé écrit `/kick <canal> <membre>`) ;
-  l'instruction envoyée au serveur, elle, porte bien `channel_name` et `member_name`.
+*(Mis à jour après la partie C : `UPDATE_USER`, `/kick <canal> <membre>`, la limitation des essais
+et l'authentification du Diffie-Hellman sont maintenant faits.)*
+- `CHANNEL_LIST` et `UPDATED_USERS` renvoient encore une liste complète en plus des évènements unitaires
+  (`CHANNEL_CREATED`, `USER_UPDATED`) : la TUI s'en sert pour se resynchroniser.
 - Un PM est chiffré avec la clé du destinataire : l'expéditeur ne peut pas le relire
   dans son historique (limite du schéma imposé par l'énoncé).
-- Pas de limitation du nombre d'essais de mot de passe (attaque en ligne possible) ;
-  le Diffie-Hellman reste non authentifié (voir partie A, point 2).
+- **Première connexion d'un nouveau PC** : si `server.pub` n'a pas été copié et qu'un attaquant est déjà
+  au milieu à ce moment-là, le client enregistre la clé de l'attaquant (même limite que SSH). Parade :
+  copier `server.pub` à côté du client, ou comparer l'empreinte affichée par le client et par le serveur.
 - **Le serveur détient la clé privée de chaque canal** (colonne `channel.private_key`, imposée par le schéma
   de l'énoncé) : il peut déchiffrer les messages de canal. Seuls les messages privés sont chiffrés de bout en bout
   au sens strict (le serveur n'a jamais la clé privée RSA des utilisateurs, qui reste dans `<pseudo>.key`).
@@ -128,7 +166,7 @@ de clé fonctionne exactement pareil, juste avec un nombre plus grand.
 
 **Fichier :** `common/security.py`.
 
-**Limite restant assumée (hors scope) :** ce Diffie-Hellman n'est pas
+**Limite restant assumée (hors scope) — corrigée depuis, voir partie C, point 1 :** ce Diffie-Hellman n'est pas
 authentifié — un attaquant capable de s'interposer activement entre le client
 et le serveur (attaque de l'homme du milieu) pourrait en théorie négocier deux
 clés distinctes avec chacun. Corriger ça demanderait un mécanisme

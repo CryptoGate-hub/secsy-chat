@@ -1,4 +1,6 @@
 argon2-cffi
+# Version fixée : sous Windows, "Smart App Control" bloque la DLL des versions plus récentes
+argon2-cffi-bindings==25.1.0
 pycryptodomex
 jsonschema
 
