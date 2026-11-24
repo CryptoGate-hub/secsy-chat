@@ -6,6 +6,27 @@ qui a été changé. Fichiers concernés indiqués entre parenthèses.
 
 ---
 
+## Partie D — Relecture finale du dépôt (24/11/2026)
+
+Failles complémentaires découvertes par Abdul Rahman Alahmad, corrections par Nouh Fache. Relecture finale
+du dépôt complet puis tests avec le vrai `server.py` et des clients sans interface : les correctifs de la partie C
+tiennent (rejeu refusé, Diffie-Hellman signé, verrouillage des essais). Les points suivants ont été trouvés et corrigés.
+
+| # | Faille | Preuve avant correction | Correction | Fichiers |
+|---|---|---|---|---|
+| 1 | **Message géant qui bloque `#general`** (déni de service persistant) | 2 messages de 6 Mo dans `#general` : l'historique envoyé à un nouvel arrivant faisait 12 Mo, au-dessus de la limite de 10 Mo du client, qui coupait la connexion à chaque arrivée | Texte chiffré limité à 16 Ko, clé chiffrée à 1 Ko ; 10 messages maximum toutes les 10 s par connexion | `server.py` |
+| 2 | **Mot de passe de canal privé devinable** | 40 essais faux d'affilée sur `JOIN_CHANNEL`, aucun blocage, puis le bon mot de passe accepté | Même mécanisme que la connexion : 5 échecs puis attente croissante, par utilisateur | `server.py` |
+| 3 | **Kick qui déplace aussi les sessions d'un autre canal** | Bob dans `#dev` kické de `#room` : renvoyé de force dans `#general` | Seules les sessions présentes dans le canal concerné sont déplacées | `server.py` |
+| 4 | **`/ia2` pouvait envoyer une clé privée à Google** | `/ia2 alice.key` lisait le fichier et l'envoyait à Gemini | Les fichiers `.key`, `.pem`, `.db` et `.log` sont refusés | `ai_assistant.py` |
+| 5 | Nettoyage | Imports inutilisés, `**` affiché tel quel dans la TUI | Retirés | `client.py`, `common/network.py`, `ai_assistant.py` |
+
+**Limites assumées, documentées**
+- Le verrouillage des essais de connexion permet à un tiers de bloquer temporairement un pseudo (compromis classique).
+- Les clés publiques des autres utilisateurs ne sont pas mémorisées d'une session à l'autre côté client.
+- La fin de la poignée de main (clé publique RSA, timestamp signé, `AUTH_OK`) circule non chiffrée : rien de secret, mais ce n'est pas aligné sur le reste du protocole.
+
+---
+
 ## Partie C — Deuxième audit : failles démontrées puis corrigées (24/11/2026)
 
 Méthode : le vrai `server.py` a été lancé, avec des clients sans interface qui réutilisent les

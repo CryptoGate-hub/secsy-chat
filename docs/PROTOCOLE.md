@@ -172,7 +172,7 @@ Voir le [README](../README.md#installation).
 python server.py
 ```
 
-Le serveur écoute sur `0.0.0.0:4000`. Les logs sont écrits dans `server.log` et affichés en console. La base de données `messenger.db` est créée automatiquement au premier lancement, ainsi que les canaux système `#general`, `#dev` et `#random`, la clé d'identité `server.key` et sa clé publique `server.pub` (empreinte affichée au démarrage). Une connexion qui ne termine pas sa poignée de main en 15 s est coupée, et une même adresse IP ne peut pas ouvrir plus de 10 connexions simultanées.
+Le serveur écoute sur `0.0.0.0:4000`. Les logs sont écrits dans `server.log` et affichés en console. La base de données `messenger.db` est créée automatiquement au premier lancement, ainsi que les canaux système `#general`, `#dev` et `#random`, la clé d'identité `server.key` et sa clé publique `server.pub` (empreinte affichée au démarrage). Une connexion qui ne termine pas sa poignée de main en 15 s est coupée, et une même adresse IP ne peut pas ouvrir plus de 10 connexions simultanées. Un message dont le texte chiffré dépasse 16 Ko est refusé, et une connexion ne peut envoyer que 10 messages toutes les 10 secondes.
 
 ### Démarrer un client
 
