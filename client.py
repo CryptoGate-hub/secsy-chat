@@ -20,7 +20,7 @@ from secsychat_tui import SecsyChatTui, TuiMessage, TuiMessageType, TuiMessageSe
 # Assistant IA (bonus, hors énoncé) — isolé dans son propre fichier.
 # Voir ai_assistant.py pour l'explication complète (notamment la vulnérabilité
 # E2EE identifiée en cours et comment elle est gérée).
-from ai_assistant import ask_ai, AI_ENABLED, AI_WARNING
+from ai_assistant import ask_ai, AI_ENABLED, AI_WARNING, AI_DISABLED_REASON
 
 # ==================== FICHIERS LOCAUX (énoncé 3.3) ====================
 # <pseudo>.key  : clé privée RSA de l'utilisateur (jamais envoyée au serveur)
@@ -129,19 +129,40 @@ def _verify_and_decrypt(msg: dict, decrypt_key: bytes, expected_recipient_id: st
         return None, f"déchiffrement impossible ({e})"
 
 
-def _send(sock, transport_key: bytes, ex_type: ExchangeType, payload: bytes):
-    """Chiffre la charge (AES-GCM) ; le type d'échange voyage dans l'en-tête (et est authentifié)."""
-    n, _, ct, tag = security.aes_encrypt(payload, transport_key, aad=bytes([ex_type.value]))
-    network.send_message(sock, n + ct + tag, ex_type.value)
+def _send(sock, cipher: security.TransportCipher, ex_type: ExchangeType, payload: bytes):
+    """Chiffre la charge (AES-GCM + compteur anti-rejeu) ; le type d'échange voyage dans l'en-tête.
+    Le verrou garde l'ordre des numéros : le thread d'écoute envoie aussi (messages privés)."""
+    with cipher.lock:
+        network.send_message(sock, cipher.seal(ex_type.value, payload), ex_type.value)
 
 
 def _stmt(name: str, data: dict) -> bytes:
     return json.dumps({"timestamp": int(t_time.time()), "payload": {"name": name, "data": data}}).encode()
 
 
+SERVER_PUB_FILE = "server.pub"   # clé publique du serveur (fournie par le serveur, ou enregistrée à la 1re connexion)
+
+
+def _check_server_identity(server_pub: bytes) -> str:
+    """Vérifie que la clé du serveur est bien celle attendue (server.pub).
+    Fichier absent : 1re connexion, la clé est enregistrée (comme known_hosts de SSH).
+    Retourne un message à afficher, ou lève PermissionError si la clé a changé."""
+    fingerprint = security.key_fingerprint(server_pub)
+    if os.path.exists(SERVER_PUB_FILE):
+        if security.key_fingerprint(open(SERVER_PUB_FILE, "rb").read()) != fingerprint:
+            raise PermissionError("❌ La clé du serveur ne correspond pas à server.pub : possible attaque "
+                                  "de l'homme du milieu. Connexion annulée (mot de passe NON envoyé).")
+        return ""
+    with open(SERVER_PUB_FILE, "wb") as f:
+        f.write(server_pub)
+    return (f"🔐 Première connexion à ce serveur : sa clé est enregistrée dans {SERVER_PUB_FILE} "
+            f"(empreinte {fingerprint}). Vérifie qu'elle correspond à celle affichée par le serveur.")
+
+
 def _handshake(sock, pseudo: str, password: str, rsa_pub: bytes, rsa_priv: bytes) -> tuple:
-    """DH d'abord (clé de transport), puis identifiants chiffrés + timestamp signé RSA.
-    Retourne (clé de transport, identifiant de l'utilisateur).
+    """DH d'abord (clé de transport) authentifié par la signature du serveur, puis identifiants
+    chiffrés + timestamp signé RSA.
+    Retourne (chiffrement de transport, identifiant de l'utilisateur, message sur la clé du serveur).
 
     Avant : le pseudo et le mot de passe partaient en clair sur le réseau, avant
     même l'échange Diffie-Hellman. N'importe qui pouvait les lire avec Wireshark.
@@ -157,14 +178,23 @@ def _handshake(sock, pseudo: str, password: str, rsa_pub: bytes, rsa_priv: bytes
     shared        = security.diffie_hellman_compute_shared_secret(my_priv, server_pub, p)
     transport_key = security.diffie_hellman_derive_shared_key(shared)
 
+    # 1 bis) Le serveur prouve son identité : signature des deux clés DH avec sa clé (server.key).
+    #        Sans cette vérification, un "homme du milieu" recevait le mot de passe en clair.
+    id_pem_b64, id_sig_b64 = network.receive_message(sock).split(b"|", 1)
+    id_pem   = base64.b64decode(id_pem_b64)
+    key_info = _check_server_identity(id_pem)
+    if not security.rsa_verify(id_pem, security.dh_signed_data(server_pub, my_pub), base64.b64decode(id_sig_b64)):
+        raise PermissionError("❌ Signature du serveur invalide : connexion annulée (mot de passe NON envoyé).")
+    cipher = security.TransportCipher(transport_key, is_server=False)
+
     # 2) Identifiants — chiffrés avec la clé de transport qu'on vient d'établir
     creds = json.dumps({"pseudo": pseudo, "password": password}).encode()
-    nonce, _, ct, tag = security.aes_encrypt(creds, transport_key)
-    network.send_message(sock, nonce + ct + tag)
+    network.send_message(sock, cipher.seal(0, creds))
 
     auth_response = network.receive_message(sock)
     if not auth_response or not auth_response.startswith(b"AUTH_OK|"):
-        raise PermissionError("❌ Connexion refusée (mot de passe incorrect ou pseudo invalide).")
+        raise PermissionError("❌ Connexion refusée (mot de passe incorrect, pseudo invalide, "
+                              "ou trop d'essais : patiente avant de réessayer).")
     user_id = auth_response.decode().split("|", 1)[1]
 
     # 3) Clé publique RSA + timestamp signé avec la clé privée
@@ -176,7 +206,7 @@ def _handshake(sock, pseudo: str, password: str, rsa_pub: bytes, rsa_priv: bytes
     if network.receive_message(sock) != b"AUTH_OK_RSA":
         raise PermissionError("❌ Authentification RSA échouée (clé <pseudo>.key différente de celle du compte ?).")
 
-    return transport_key, user_id
+    return cipher, user_id, key_info
 
 def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, profile: dict,
                    rsa_priv: bytes, rsa_pub: bytes, context: str = None):
@@ -187,17 +217,19 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
     session = {"user_id": None}
 
     try:
-        transport_key, session["user_id"] = _handshake(sock, pseudo, password, rsa_pub, rsa_priv)
+        cipher, session["user_id"], key_info = _handshake(sock, pseudo, password, rsa_pub, rsa_priv)
         logger.info("Handshake réussi.")
+        if key_info:
+            q_in.put(TuiMessage(t_time.time(), "Système", key_info))
 
         q_in.put(TuiMessage(t_time.time(), "Système",
-            "✅ Connecté avec succès ! Tape /commands pour voir les commandes."))
+            "✅ Connecté. /commands pour l'aide."))
 
         t_time.sleep(0.6)
 
         # Demande des listes
-        _send(sock, transport_key, ExchangeType.STATEMENT, _stmt("GET_CHANNELS", {}))
-        _send(sock, transport_key, ExchangeType.STATEMENT, _stmt("GET_USERS", {}))
+        _send(sock, cipher, ExchangeType.STATEMENT, _stmt("GET_CHANNELS", {}))
+        _send(sock, cipher, ExchangeType.STATEMENT, _stmt("GET_USERS", {}))
 
     except Exception as e:
         logger.error(f"Handshake failed: {e}")
@@ -212,7 +244,7 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
     def _use_ai(question: str, fichiers: list = None, mode: str = "normal") -> str:
         """Point d'entrée unique vers l'IA : avertit l'utilisateur une fois, puis délègue à ai_assistant."""
         if not AI_ENABLED:
-            return "❌ Assistant IA désactivé sur ce client (AI_ENABLED = False dans ai_assistant.py)."
+            return f"❌ IA indisponible : {AI_DISABLED_REASON}"
         if not ai_warning_shown["done"]:
             q_in.put(TuiMessage(t_time.time(), "Système", AI_WARNING))
             ai_warning_shown["done"] = True
@@ -267,7 +299,7 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
         if text is None:
             logger.warning(f"Message de {sender_name} ignoré : {reason}")
             if live:
-                q_in.put(TuiMessage(t_time.time(), "Système", f"⚠️ Message de {sender_name} ignoré ({reason})"))
+                q_in.put(TuiMessage(t_time.time(), "Système", f"⚠️ Message de {sender_name} rejeté ({reason})"))
             return
         q_in.put(TuiMessage(t_time.time() if live else float(msg["timestamp"]), label, text))
 
@@ -279,8 +311,12 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
                 break
             try:
                 ex_type, raw   = exchange
-                nonce, ct, tag = raw[:16], raw[16:-16], raw[-16:]
-                data_part      = security.aes_decrypt(ct, transport_key, (nonce, b"", tag), aad=bytes([ex_type]))
+                try:
+                    data_part  = cipher.open(ex_type, raw)   # échoue si la trame est modifiée ou rejouée
+                except Exception:
+                    q_in.put(TuiMessage(t_time.time(), "Système", "❌ Trame invalide ou rejouée : connexion coupée."))
+                    sock.close()
+                    break
                 logger.debug(f"Échange de type {ex_type} reçu ({len(data_part)} octets)")
 
                 if ex_type == ExchangeType.EVENT.value:
@@ -314,7 +350,7 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
                         profile["context"] = d["id"]
                         _save_profile(pseudo, profile)
                         q_in.put(TuiMessage(t_time.time(), "Système",
-                                            f"✅ Canal rejoint : **#{current_channel['name']}**"))
+                                            f"✅ Canal #{current_channel['name']}"))
 
                     elif name == "LAST_MESSAGES":
                         # 20 derniers messages du canal + 20 derniers messages privés (déjà triés par le serveur)
@@ -335,23 +371,23 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
                                     {"id": session["user_id"], "name": pseudo},
                                     {"type": "USER", "id": target_id, "name": target_name},
                                     msg_text, target_pub, rsa_priv)
-                                _send(sock, transport_key, ExchangeType.MESSAGE, payload)
+                                _send(sock, cipher, ExchangeType.MESSAGE, payload)
                             except Exception as e:
                                 logger.error(f"Chiffrement PM échoué : {e}")
                                 q_in.put(TuiMessage(t_time.time(), "Système", f"❌ Impossible de chiffrer le PM : {e}"))
 
                     elif name == "KICKED":
                         q_in.put(TuiMessage(t_time.time(), "Système",
-                                            d.get("message", "Vous avez été kické du canal.")))
+                                            d.get("message", "Vous avez été expulsé du canal.")))
                         # Le serveur envoie CHANNEL_JOINED + LAST_MESSAGES de #general juste après
                         current_channel["priv"] = current_channel["pub"] = None
 
                     elif name == "KICK_SUCCESS":
-                        q_in.put(TuiMessage(t_time.time(), "Système", f"✅ {d.get('target')} a été expulsé."))
+                        q_in.put(TuiMessage(t_time.time(), "Système", f"✅ {d.get('target')} expulsé"))
 
                     elif name == "CHANNEL_DELETED":
                         deleted_name = d.get("name", "")
-                        q_in.put(TuiMessage(t_time.time(), "Système", f"🗑️ Canal '{deleted_name}' supprimé"))
+                        q_in.put(TuiMessage(t_time.time(), "Système", f"🗑️ #{deleted_name} supprimé"))
                         _ui_remove(ui_channels, deleted_name, TuiMessageType.DELETED_CHANNEL_EVENT)
                         if current_channel["id"] == d.get("id"):
                             # Le canal sélectionné n'existe plus : on retourne dans #general
@@ -361,7 +397,7 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
 
                     elif name == "PM_SENT":
                         q_in.put(TuiMessage(t_time.time(), "Système",
-                                            f"✅ Message privé envoyé à {d.get('target')}"))
+                                            f"✅ MP envoyé à {d.get('target')}"))
 
                     elif name == "ERROR":
                         q_in.put(TuiMessage(t_time.time(), "Système", f"⚠️ {d.get('message')}"))
@@ -369,6 +405,11 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
                     elif name in ["SYSTEM", "Système"]:
                         msg_text = d.get("message") if isinstance(d, dict) else str(d)
                         q_in.put(TuiMessage(t_time.time(), "Système", msg_text))
+
+                    elif name == "USER_UPDATED":
+                        # Un utilisateur a signalé son activité (instruction UPDATE_USER)
+                        if d.get("name"):
+                            _ui_add(ui_users, d["name"], TuiMessageType.CONNECTED_USER_EVENT)
 
                     elif name == "UPDATED_USERS":
                         users = d.get("users", [])
@@ -394,53 +435,42 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
     # (instruction envoyée directement : pas de /join, donc pas de fenêtre "sans clé" côté client)
     if context:
         t_time.sleep(0.4)
-        _send(sock, transport_key, ExchangeType.STATEMENT, _stmt("JOIN_CHANNEL", {"id": context}))
+        _send(sock, cipher, ExchangeType.STATEMENT, _stmt("JOIN_CHANNEL", {"id": context}))
 
+    last_activity_sent = [0.0]
     while True:
         tui_msg = q_out.get()
         cmd     = tui_msg.message.strip()
         parts   = cmd.split()
 
+        # Instruction UPDATE_USER : signale l'activité de l'utilisateur (au plus une fois par minute)
+        if t_time.time() - last_activity_sent[0] >= 60:
+            last_activity_sent[0] = t_time.time()
+            try:
+                _send(sock, cipher, ExchangeType.STATEMENT, _stmt("UPDATE_USER", {}))
+            except Exception as e:
+                logger.error(f"UPDATE_USER échoué : {e}")
+
         try:
             if cmd.startswith(("/commands", "/man")):
-                help_text = """📋 **Commandes disponibles** :
-
-**Général :**
-  /commands ou /man     → Affiche cette aide
-  /users ou /who         → Rafraîchir les utilisateurs connectés
-  /status ou /where      → Voir le canal actuel
-
-**Canaux :**
-  /create <nom> [mdp]    → Crée un canal
-  /join <nom> [mdp]      → Rejoint un canal
-  /leave                 → Quitte le canal actuel
-
-**Administration :**
-  /kick <pseudo>              → Expulse un utilisateur (permanent)
-  /kick <pseudo> <secondes>   → Expulse temporairement (ex: /kick Bob 300)
-  /delete <nom>               → Supprime un canal (créateur)
-
-**Messages privés :**
-  /pm <pseudo> <message> → Envoie un MP chiffré
-
-**Intelligence Artificielle :**
-  /ia <question>          → IA Rapide (Flash)
-  /ia pro <question>      → IA Experte (Pro)
-  /ia2 <fichiers...> [prompt] → Analyse de fichiers (Pro)"""
+                help_text = """Commandes
+  Général   /users  /status  /commands
+  Canaux    /create <nom> [mdp]   /join <nom> [mdp]   /leave
+  Admin     /kick <canal> <membre> [secondes]   /delete <nom>
+  Privé     /pm <pseudo> <message>
+  IA        /ia <question>   /ia pro <question>   /ia2 <fichiers> [consigne]   @whitehat <question>"""
                 
                 q_in.put(TuiMessage(t_time.time(), "Système", help_text))
 
             elif cmd.startswith("/list"):
-                q_in.put(TuiMessage(t_time.time(), "Système", 
-                    "✅ Les canaux sont mis à jour automatiquement à leur création."))
+                q_in.put(TuiMessage(t_time.time(), "Système", "La liste des canaux se met à jour toute seule."))
 
             elif cmd.startswith("/users") or cmd.startswith("/who"):
-                _send(sock, transport_key, ExchangeType.STATEMENT, _stmt("GET_USERS", {}))
+                _send(sock, cipher, ExchangeType.STATEMENT, _stmt("GET_USERS", {}))
 
             elif cmd.startswith("/status") or cmd.startswith("/where"):
                 ch_name = current_channel["name"]
-                q_in.put(TuiMessage(t_time.time(), "Système", 
-                    f"📍 Vous êtes dans le canal : **#{ch_name}**"))
+                q_in.put(TuiMessage(t_time.time(), "Système", f"📍 #{ch_name}"))
 
             elif cmd.startswith("/create ") and len(parts) >= 2:
                 ch_name = parts[1]
@@ -448,7 +478,7 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
                 # Ne pas mettre à jour name ici : on attend CHANNEL_JOINED pour confirmer
                 current_channel["_pending_name"] = ch_name
                 secret = " ".join(parts[2:]) if len(parts) > 2 else ""
-                _send(sock, transport_key, ExchangeType.STATEMENT,
+                _send(sock, cipher, ExchangeType.STATEMENT,
                       _stmt("CREATE_CHANNEL", {"name": ch_name, "secret": secret}))
 
             elif cmd.startswith("/join ") and len(parts) >= 2:
@@ -457,50 +487,42 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
                 # Idem : on attend CHANNEL_JOINED avant de valider le canal actif
                 current_channel["_pending_name"] = ch_name
                 secret = " ".join(parts[2:]) if len(parts) > 2 else ""
-                _send(sock, transport_key, ExchangeType.STATEMENT,
+                _send(sock, cipher, ExchangeType.STATEMENT,
                       _stmt("JOIN_CHANNEL", {"name": ch_name, "secret": secret}))
 
             elif cmd.startswith("/leave"):
-                _send(sock, transport_key, ExchangeType.STATEMENT,
+                _send(sock, cipher, ExchangeType.STATEMENT,
                       _stmt("LEAVE_CHANNEL", {"name": current_channel["name"]}))
                 current_channel["priv"] = current_channel["pub"] = None
                 current_channel["name"] = "general"
-                q_in.put(TuiMessage(t_time.time(), "Système", "➡️ Retour automatique vers #general..."))
+                q_in.put(TuiMessage(t_time.time(), "Système", "➡️ Retour dans #general"))
                 
-            elif cmd.startswith("/kick ") and len(parts) >= 2:
-                target = parts[1]
-                duration = ""
-                
-                if len(parts) >= 3 and parts[2].isdigit():
-                    duration = parts[2]
-                
-                # On envoie le target et la durée séparément (plus propre)
-                _send(sock, transport_key, ExchangeType.STATEMENT,
-                      _stmt("KICK_CHANNEL_MEMBER", {"channel_name": current_channel["name"],
+            elif cmd.startswith("/kick "):
+                # Énoncé : /kick <canal> <membre> ; durée en secondes optionnelle (sinon permanent)
+                if len(parts) < 3 or (len(parts) >= 4 and not parts[3].isdigit()):
+                    q_in.put(TuiMessage(t_time.time(), "Système",
+                        "Usage : /kick <canal> <membre> [secondes]"))
+                    continue
+                ch_name, target = parts[1].lstrip("#"), parts[2]
+                duration = parts[3] if len(parts) >= 4 else ""
+                _send(sock, cipher, ExchangeType.STATEMENT,
+                      _stmt("KICK_CHANNEL_MEMBER", {"channel_name": ch_name,
                                                     "member_name": target, "duration": duration}))
-                
-                q_in.put(TuiMessage(t_time.time(), "Système", 
-                    f"👢 Commande de kick envoyée pour {target}"))
+                q_in.put(TuiMessage(t_time.time(), "Système",
+                    f"👢 Commande de kick envoyée pour {target} (#{ch_name})"))
 
             elif cmd.startswith("/delete ") and len(parts) >= 2:
-                _send(sock, transport_key, ExchangeType.STATEMENT,
+                _send(sock, cipher, ExchangeType.STATEMENT,
                       _stmt("DELETE_CHANNEL", {"name": parts[1]}))
 
             elif cmd.startswith("/pm ") and len(parts) >= 3:
                 target = parts[1]
                 message_text = " ".join(parts[2:])
                 # it.8 — Récupérer la clé publique RSA du destinataire, puis chiffrer E2EE
-                _send(sock, transport_key, ExchangeType.STATEMENT,
+                _send(sock, cipher, ExchangeType.STATEMENT,
                       _stmt("GET_USER_KEY", {"name": target}))
                 pending_pms[target] = message_text
-                q_in.put(TuiMessage(t_time.time(), "Système", f"→ Chiffrement du message pour {target}…"))
-
-            elif cmd.startswith("/ia "):
-                question = cmd[4:].strip()
-                if question:
-                    q_in.put(TuiMessage(t_time.time(), "WhiteHat-AI", "🤔 Réflexion en cours..."))
-                    response = _use_ai(question=question, mode="normal")
-                    q_in.put(TuiMessage(t_time.time(), "WhiteHat-AI", response))
+                q_in.put(TuiMessage(t_time.time(), "Système", f"🔒 Chiffrement pour {target}…"))
 
             elif cmd.startswith(("/ia pro ", "/ia2 ")):
                 argument = cmd[8:].strip() if cmd.startswith("/ia pro ") else cmd[5:].strip()
@@ -515,7 +537,7 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
                 prompt = " ".join([p for p in parts_list if p not in files]) or "Analyse ce contenu."
 
                 ai_name = "WhiteHat-AI 2.0"
-                q_in.put(TuiMessage(t_time.time(), ai_name, "🤔 Analyse en cours..."))
+                q_in.put(TuiMessage(t_time.time(), ai_name, "…"))
 
                 response = _use_ai(
                     question=prompt,
@@ -524,25 +546,30 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
                 )
                 q_in.put(TuiMessage(t_time.time(), ai_name, response))
 
-            elif not cmd.startswith("/"):
-                if not current_channel.get("pub"):
-                    q_in.put(TuiMessage(t_time.time(), "Système", "⚠️ Pas dans un canal. Utilisez /create ou /join"))
-                    continue
-
-                # === INTERACTION AVEC LES IA ===
-                lower_cmd = cmd.lower().strip()
-                if lower_cmd.startswith(("whitehat-ai", "whitehat ai", "@whitehat", "whitehat")):
-                    question = cmd.split(maxsplit=1)[1] if len(cmd.split()) > 1 else cmd
-                    q_in.put(TuiMessage(t_time.time(), "WhiteHat-AI", "🤔 Réflexion en cours..."))
+            # Testé APRÈS "/ia pro" et "/ia2" : sinon "/ia pro ..." partait toujours en mode normal
+            elif cmd.startswith("/ia "):
+                question = cmd[4:].strip()
+                if question:
+                    q_in.put(TuiMessage(t_time.time(), "WhiteHat-AI", "…"))
                     response = _use_ai(question=question, mode="normal")
                     q_in.put(TuiMessage(t_time.time(), "WhiteHat-AI", response))
+
+            elif not cmd.startswith("/"):
+                if not current_channel.get("pub"):
+                    q_in.put(TuiMessage(t_time.time(), "Système", "⚠️ Aucun canal actif : /join <nom>"))
                     continue
 
-                elif any(keyword in lower_cmd for keyword in ["pro", "ia2", "ia 2"]) and ("whitehat" in lower_cmd or "ia" in lower_cmd):
-                    question = cmd.split(maxsplit=1)[1] if len(cmd.split()) > 1 else cmd
-                    q_in.put(TuiMessage(t_time.time(), "WhiteHat-AI 2.0", "🤔 Réflexion Pro en cours..."))
-                    response = _use_ai(question=question, mode="pro")
-                    q_in.put(TuiMessage(t_time.time(), "WhiteHat-AI 2.0", response))
+                # === INTERACTION AVEC L'IA ===
+                # Uniquement si le message COMMENCE par une mention explicite de l'IA.
+                # Avant, tout message contenant "pro" et "ia" (ex. "problème ... via ...")
+                # partait chez Google au lieu du canal.
+                lower_cmd = cmd.lower()
+                if lower_cmd.startswith(("@whitehat", "whitehat-ai ")):
+                    question = cmd.split(maxsplit=1)[1] if len(cmd.split()) > 1 else ""
+                    if question:
+                        q_in.put(TuiMessage(t_time.time(), "WhiteHat-AI", "…"))
+                        response = _use_ai(question=question, mode="normal")
+                        q_in.put(TuiMessage(t_time.time(), "WhiteHat-AI", response))
                     continue
 
                 # Message normal dans le canal
@@ -550,7 +577,7 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
                     {"id": session["user_id"], "name": pseudo},
                     {"type": "CHANNEL", "id": current_channel["id"], "name": current_channel["name"]},
                     cmd, current_channel["pub"], rsa_priv)
-                _send(sock, transport_key, ExchangeType.MESSAGE, payload)
+                _send(sock, cipher, ExchangeType.MESSAGE, payload)
                 q_in.put(TuiMessage(t_time.time(), pseudo, cmd))
 
         except Exception as e:

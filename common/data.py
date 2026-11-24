@@ -1,3 +1,4 @@
+import time
 from common import database
 
 db_conn = None
@@ -7,6 +8,12 @@ db_conn = None
 
 def user_exists(name: str) -> bool:
     return len(database.select_data(db_conn, "SELECT 1 FROM user WHERE name=?", (name,))) > 0
+
+
+def similar_user_exists(name: str) -> bool:
+    """Vrai si un AUTRE compte porte le même pseudo à la casse près ("bob" alors que "Bob" existe)."""
+    return len(database.select_data(db_conn,
+        "SELECT 1 FROM user WHERE name=? COLLATE NOCASE AND name<>?", (name, name))) > 0
 
 
 def create_user(user_id: str, name: str, hashed_password: str):
@@ -43,6 +50,12 @@ def touch_user(name: str):
     """Met à jour last_activity_at à chaque échange (it.3)."""
     database.update_data(db_conn,
         "UPDATE user SET last_activity_at=CURRENT_TIMESTAMP WHERE name=?", (name,))
+
+
+def get_user_activity(name: str) -> str:
+    """Retourne last_activity_at (texte "AAAA-MM-JJ HH:MM:SS", UTC) ou ""."""
+    res = database.select_data(db_conn, "SELECT last_activity_at FROM user WHERE name=?", (name,))
+    return res[0][0] if res else ""
 
 
 # ====================== CANAUX ======================
@@ -106,6 +119,7 @@ def delete_channel(channel_id: str):
     """Supprime un canal, ses membres et ses messages."""
     database.delete_data(db_conn, "DELETE FROM channel_message WHERE recipient_id=?", (channel_id,))
     database.delete_data(db_conn, "DELETE FROM channel_member WHERE channel_id=?", (channel_id,))
+    database.delete_data(db_conn, "DELETE FROM channel_ban WHERE channel_id=?", (channel_id,))
     database.delete_data(db_conn, "DELETE FROM channel WHERE id=?", (channel_id,))
 
 
@@ -132,6 +146,32 @@ def get_member_ids(channel_id: str) -> list:
     res = database.select_data(db_conn,
         "SELECT user_id FROM channel_member WHERE channel_id=?", (channel_id,))
     return [r[0] for r in res]
+
+
+# ====================== EXPULSIONS ======================
+
+def ban_member(channel_id: str, user_id: str, until: int = None):
+    """Expulse un membre : until = fin de l'expulsion (timestamp Unix), None = permanente."""
+    database.delete_data(db_conn, "DELETE FROM channel_ban WHERE channel_id=? AND user_id=?",
+                         (channel_id, user_id))
+    database.insert_data(db_conn, "channel_ban", ("channel_id", "user_id", "until"),
+                         (channel_id, user_id, until))
+
+
+def ban_remaining(channel_id: str, user_id: str):
+    """None = pas expulsé ; -1 = expulsion permanente ; sinon secondes restantes."""
+    res = database.select_data(db_conn,
+        "SELECT until FROM channel_ban WHERE channel_id=? AND user_id=?", (channel_id, user_id))
+    if not res:
+        return None
+    until = res[0][0]
+    if until is None:
+        return -1
+    if until > time.time():
+        return max(1, int(until - time.time()))   # jamais 0 tant que l'expulsion court
+    database.delete_data(db_conn, "DELETE FROM channel_ban WHERE channel_id=? AND user_id=?",
+                         (channel_id, user_id))   # expulsion temporaire terminée
+    return None
 
 
 # ====================== MESSAGES DE CANAL ======================

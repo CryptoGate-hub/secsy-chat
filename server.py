@@ -1,12 +1,9 @@
 import logging, threading, json, base64, time, re
-from collections import defaultdict
 from common import database, network, security, data
 from common.exchange import ExchangeType
 from common.message import parse_message
 from common.statement import parse_statement
 
-# Expulsions temporaires : temp_kicks[channel_id][user_id] = heure de fin
-temp_kicks = defaultdict(dict)
 # Canaux système protégés
 DEFAULT_CHANNELS = {"general", "dev", "random"}
 # Pseudos réservés (les IA sont affichées dans la liste des utilisateurs)
@@ -19,7 +16,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Server")
 
-clients      = {}                 # conn -> infos de la session (pseudo, user_id, transport_key, channel_id)
+clients      = {}                 # conn -> infos de la session (pseudo, user_id, cipher, channel_id)
 clients_lock = threading.Lock()   # protège "clients" (plusieurs threads y accèdent)
 
 db_conn      = database.connect_to_db("messenger.db")
@@ -27,6 +24,25 @@ database.execute_seed(db_conn)
 data.db_conn = db_conn
 
 MAX_CLOCK_DRIFT = 300             # 5 minutes (énoncé 2.2.2) : écart toléré pour un timestamp signé
+HANDSHAKE_TIMEOUT = 15            # secondes pour terminer la connexion, sinon on coupe
+MAX_CONN_PER_IP   = 10            # connexions simultanées maximum depuis une même adresse IP
+
+# Identité du serveur : sa clé privée (server.key) signe chaque Diffie-Hellman.
+# server.pub est la clé publique à donner aux clients (ils la vérifient avant d'envoyer
+# leur mot de passe) : sans elle, un "homme du milieu" pouvait se faire passer pour le serveur.
+SERVER_KEY = security.load_or_create_rsa_key("server.key")
+SERVER_PUB = security.rsa_public_from_private(SERVER_KEY)
+with open("server.pub", "wb") as _f:
+    _f.write(SERVER_PUB)
+
+# Limitation des essais de mot de passe : après 5 échecs sur un pseudo (ou 20 depuis une même IP,
+# tous pseudos confondus), attente de 30 s, puis 60 s, 120 s... (15 min maximum)
+MAX_FAILED = {"user": 5, "ip": 20}
+BASE_DELAY, MAX_DELAY = 30, 900
+_failed      = {}                 # ("user", pseudo) ou ("ip", adresse) -> [nombre d'échecs, bloqué jusqu'à]
+_failed_lock = threading.Lock()
+_conn_per_ip = {}                 # adresse IP -> connexions ouvertes
+_conn_lock   = threading.Lock()
 
 
 def create_default_channels():
@@ -41,7 +57,38 @@ def create_default_channels():
 create_default_channels()
 
 
+def _auth_blocked(keys) -> int:
+    """Secondes d'attente restantes avant un nouvel essai (0 = autorisé)."""
+    now = time.time()
+    with _failed_lock:
+        return int(max([_failed.get(k, [0, 0])[1] - now for k in keys] + [0]))
+
+
+def _auth_failed(keys):
+    with _failed_lock:
+        for k in keys:
+            entry = _failed.setdefault(k, [0, 0])
+            entry[0] += 1
+            limit = MAX_FAILED[k[0]]
+            if entry[0] >= limit:
+                entry[1] = time.time() + min(BASE_DELAY * 2 ** (entry[0] - limit), MAX_DELAY)
+
+
+def _auth_succeeded(keys):
+    with _failed_lock:
+        for k in keys:
+            _failed.pop(k, None)
+
+
 # ====================== AUTHENTIFICATION ======================
+
+def _recv(conn) -> bytes:
+    """Lit un échange de la poignée de main ; erreur claire si le client a fermé la connexion."""
+    data_bytes = network.receive_message(conn)
+    if data_bytes is None:
+        raise ConnectionError("connexion fermée pendant la poignée de main")
+    return data_bytes
+
 
 def _handshake(conn, addr) -> tuple:
     """DH d'abord (clé de transport), puis authentification par mot de passe (chiffrée),
@@ -56,21 +103,32 @@ def _handshake(conn, addr) -> tuple:
     priv          = security.diffie_hellman_generate_private_key(p)
     pub           = security.diffie_hellman_compute_public_key(priv, p, g)
     network.send_message(conn, str(pub).encode())
-    cli_pub       = int(network.receive_message(conn).decode())
+    cli_pub       = int(_recv(conn).decode())
     shared        = security.diffie_hellman_compute_shared_secret(priv, cli_pub, p)
     transport_key = security.diffie_hellman_derive_shared_key(shared)
 
+    # 1 bis) Le serveur PROUVE son identité : il signe les deux clés DH de la session avec server.key.
+    #        Le client vérifie avec server.pub avant d'envoyer quoi que ce soit (anti homme du milieu).
+    dh_sig = security.rsa_sign(SERVER_KEY, security.dh_signed_data(pub, cli_pub))
+    network.send_message(conn, base64.b64encode(SERVER_PUB) + b"|" + base64.b64encode(dh_sig))
+    cipher = security.TransportCipher(transport_key, is_server=True)
+
     # 2) Identifiants — déchiffrés avec la clé de transport qu'on vient d'établir
-    raw = network.receive_message(conn)
-    nonce, ct, tag = raw[:16], raw[16:-16], raw[-16:]
-    creds_bytes = security.aes_decrypt(ct, transport_key, (nonce, b"", tag))
-    creds  = json.loads(creds_bytes.decode())
+    creds  = json.loads(cipher.open(0, _recv(conn)).decode())
     pseudo = str(creds.get("pseudo", ""))
     pwd    = str(creds.get("password", ""))
+    keys   = [("user", pseudo.lower()), ("ip", addr[0])]
 
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,20}", pseudo) or pseudo.lower() in RESERVED_NAMES:
+    wait = _auth_blocked(keys)
+    if wait:
         network.send_message(conn, b"AUTH_FAIL")
-        raise PermissionError(f"Pseudo invalide ou réservé : {pseudo!r}")
+        raise PermissionError(f"Trop d'essais pour {pseudo!r} / {addr[0]} : bloqué encore {wait} s")
+
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,20}", pseudo) or pseudo.lower() in RESERVED_NAMES \
+            or data.similar_user_exists(pseudo):   # "bob" refusé si "Bob" existe déjà
+        _auth_failed(keys[1:])
+        network.send_message(conn, b"AUTH_FAIL")
+        raise PermissionError(f"Pseudo invalide, réservé ou trop proche d'un autre : {pseudo!r}")
 
     if len(pwd) < 8:   # ← Ajout de sécurité minimale
         network.send_message(conn, b"AUTH_FAIL")
@@ -81,6 +139,7 @@ def _handshake(conn, addr) -> tuple:
         # Le compte existe : le mot de passe protège l'accès (comparaison Argon2)
         user_id = user[0]
         if not security.argon2_verify_password(pwd, user[1]):
+            _auth_failed(keys)
             network.send_message(conn, b"AUTH_FAIL")
             raise PermissionError(f"Mot de passe incorrect pour {pseudo}")
         logger.info(f"Connexion de {pseudo} (compte existant)")
@@ -93,8 +152,8 @@ def _handshake(conn, addr) -> tuple:
     network.send_message_as_str(conn, f"AUTH_OK|{user_id}")
 
     # 3) Authentification cryptographique (it.9) : timestamp signé avec la clé privée RSA
-    pub_key_pem = network.receive_message(conn)
-    ts_payload  = network.receive_message(conn)
+    pub_key_pem = _recv(conn)
+    ts_payload  = _recv(conn)
     stored_key  = data.get_user_public_key(pseudo)
     try:
         if stored_key and stored_key.strip() != pub_key_pem.decode().strip():
@@ -109,36 +168,42 @@ def _handshake(conn, addr) -> tuple:
         if not security.rsa_verify(pub_key_pem, ts_str.encode(), base64.b64decode(sig_b64)):
             raise PermissionError("Signature RSA invalide")
     except PermissionError:
+        _auth_failed(keys)
         network.send_message(conn, b"AUTH_FAIL")
         raise
     except Exception as e:
+        _auth_failed(keys)
         network.send_message(conn, b"AUTH_FAIL")
         raise PermissionError(f"Erreur auth RSA : {e}")
 
     if not stored_key:
         data.set_user_public_key(pseudo, pub_key_pem.decode())   # 1re connexion : on enregistre la clé publique
 
+    _auth_succeeded(keys[:1])
     network.send_message(conn, b"AUTH_OK_RSA")
     data.touch_user(pseudo)
-    return pseudo, user_id, transport_key
+    return pseudo, user_id, cipher
 
 
 # ====================== ENVOI ======================
 
-def _send(conn, transport_key: bytes, ex_type: ExchangeType, payload: bytes):
-    """Chiffre la charge (AES-GCM) ; le type d'échange voyage dans l'en-tête (et est authentifié)."""
-    n, _, ct, tag = security.aes_encrypt(payload, transport_key, aad=bytes([ex_type.value]))
-    network.send_message(conn, n + ct + tag, ex_type.value)
+def _send(conn, info: dict, ex_type: ExchangeType, payload: bytes):
+    """Chiffre la charge (AES-GCM + compteur anti-rejeu) ; le type d'échange voyage dans l'en-tête.
+    Le verrou garantit que les trames partent dans l'ordre de leurs numéros, même si plusieurs
+    threads écrivent au même client en même temps."""
+    cipher = info["cipher"]
+    with cipher.lock:
+        network.send_message(conn, cipher.seal(ex_type.value, payload), ex_type.value)
 
 
-def _event(conn, transport_key: bytes, name: str, data_dict: dict):
+def _event(conn, info: dict, name: str, data_dict: dict):
     payload = json.dumps({"timestamp": int(time.time()),
                           "payload": {"name": name, "data": data_dict}}).encode()
-    _send(conn, transport_key, ExchangeType.EVENT, payload)
+    _send(conn, info, ExchangeType.EVENT, payload)
 
 
 def _error(conn, info: dict, text: str):
-    _event(conn, info["transport_key"], "ERROR", {"message": text})
+    _event(conn, info, "ERROR", {"message": text})
 
 
 def _get_connected_users() -> list:
@@ -153,7 +218,7 @@ def _broadcast_user_list():
     with clients_lock:
         for conn, info in list(clients.items()):
             try:
-                _event(conn, info["transport_key"], "UPDATED_USERS", {"users": users})
+                _event(conn, info, "UPDATED_USERS", {"users": users})
             except Exception:
                 pass
 
@@ -163,7 +228,7 @@ def _broadcast_event(name: str, data_dict: dict):
     with clients_lock:
         for conn, info in list(clients.items()):
             try:
-                _event(conn, info["transport_key"], name, data_dict)
+                _event(conn, info, name, data_dict)
             except Exception:
                 pass
 
@@ -172,7 +237,7 @@ def _send_channel_joined(conn, info: dict, ch):
     """Le client rejoint un canal : on lui donne l'id, le nom et les clés du canal.
     ch = (id, secret, owner_id, private_key, public_key, is_private, name)"""
     info["channel_id"] = ch[0]
-    _event(conn, info["transport_key"], "CHANNEL_JOINED",
+    _event(conn, info, "CHANNEL_JOINED",
            {"id": ch[0], "name": ch[6], "private_key": ch[3], "public_key": ch[4]})
 
 
@@ -181,7 +246,7 @@ def _send_history(conn, info: dict, channel_id: str, n: int = 20):
     triés à nouveau par date, et seuls les N plus récents sont renvoyés."""
     messages = data.get_last_messages(channel_id, n) + data.get_last_private_messages(info["user_id"], n)
     messages.sort(key=lambda m: m["timestamp"])
-    _event(conn, info["transport_key"], "LAST_MESSAGES", {"messages": messages[-n:]})
+    _event(conn, info, "LAST_MESSAGES", {"messages": messages[-n:]})
 
 
 def _enter_channel(conn, info: dict, ch_id: str):
@@ -195,10 +260,10 @@ def _enter_channel(conn, info: dict, ch_id: str):
 def _send_to_user(user_id: str, ex_type: ExchangeType, payload: bytes):
     """Envoie un échange à toutes les sessions ouvertes d'un utilisateur."""
     with clients_lock:
-        targets = [(c, i["transport_key"]) for c, i in clients.items() if i.get("user_id") == user_id]
-    for c, key in targets:
+        targets = [(c, i) for c, i in clients.items() if i.get("user_id") == user_id]
+    for c, i in targets:
         try:
-            _send(c, key, ex_type, payload)
+            _send(c, i, ex_type, payload)
         except Exception:
             pass
 
@@ -220,10 +285,10 @@ def _handle_statement(conn, info: dict, payload: bytes):
             private_visible = [c for c in data.get_user_channels(user_id) if data.is_private_channel(c)]
             labels = [f"🔒 {c}" if data.is_private_channel(c) else f"# {c}"
                       for c in dict.fromkeys(public + private_visible)]
-            _event(conn, info["transport_key"], "CHANNEL_LIST", {"channels": labels})
+            _event(conn, info, "CHANNEL_LIST", {"channels": labels})
 
         elif name == "GET_USERS":
-            _event(conn, info["transport_key"], "UPDATED_USERS", {"users": _get_connected_users()})
+            _event(conn, info, "UPDATED_USERS", {"users": _get_connected_users()})
 
         elif name == "GET_LAST_MESSAGES":
             ch = data.get_channel(str(d.get("channel_name", "")).strip().lower())
@@ -236,7 +301,7 @@ def _handle_statement(conn, info: dict, payload: bytes):
             target_name = str(d.get("name", "")).strip()
             target      = data.get_user(target_name)
             if target and target[2]:
-                _event(conn, info["transport_key"], "USER_KEY",
+                _event(conn, info, "USER_KEY",
                        {"id": target[0], "name": target_name, "public_key": target[2]})
             else:
                 _error(conn, info, f"Clé publique de '{target_name}' introuvable")
@@ -263,7 +328,7 @@ def _handle_statement(conn, info: dict, payload: bytes):
             if not ch_pass:   # un canal privé n'est annoncé qu'à son créateur
                 _broadcast_event("CHANNEL_CREATED", {"id": ch_id, "name": ch_name})
             else:
-                _event(conn, info["transport_key"], "CHANNEL_CREATED", {"id": ch_id, "name": ch_name})
+                _event(conn, info, "CHANNEL_CREATED", {"id": ch_id, "name": ch_name})
             logger.info(f"Canal créé : {ch_name} par {pseudo}")
 
         elif name == "JOIN_CHANNEL":
@@ -275,11 +340,12 @@ def _handle_statement(conn, info: dict, payload: bytes):
                 return _error(conn, info, "Canal introuvable")
             ch_id = ch[0]
 
-            # Expulsion temporaire encore active ?
-            if user_id in temp_kicks[ch_id]:
-                if time.time() < temp_kicks[ch_id][user_id]:
-                    return _error(conn, info, "Vous êtes actuellement kické de ce canal.")
-                del temp_kicks[ch_id][user_id]
+            # Expulsion encore active ? (temporaire ou permanente, enregistrée en base)
+            remaining = data.ban_remaining(ch_id, user_id)
+            if remaining == -1:
+                return _error(conn, info, "Vous avez été expulsé définitivement de ce canal.")
+            if remaining:
+                return _error(conn, info, f"Vous êtes expulsé de ce canal encore {remaining} secondes.")
 
             if not data.is_member(ch_id, user_id):
                 # La clé secrète n'est nécessaire que pour devenir membre une première fois
@@ -300,7 +366,7 @@ def _handle_statement(conn, info: dict, payload: bytes):
                 if not data.is_member(general[0], user_id):
                     data.add_member(general[0], user_id)
                 _enter_channel(conn, info, general[0])
-                _event(conn, info["transport_key"], "SYSTEM", {"message": "✅ Vous avez été redirigé vers **#general**"})
+                _event(conn, info, "SYSTEM", {"message": "➡️ Retour dans #general"})
 
         elif name == "DELETE_CHANNEL":
             ch_name = str(d.get("name", "")).strip().lower()
@@ -313,14 +379,18 @@ def _handle_statement(conn, info: dict, payload: bytes):
                 return _error(conn, info, "Seul le créateur peut supprimer le canal")
 
             ch_id = ch[0]
+            # Un canal privé n'est annoncé qu'à ses membres : sa suppression aussi
+            notify_ids = set(data.get_member_ids(ch_id)) | {user_id} if ch[5] else None
             data.delete_channel(ch_id)
             general = data.get_channel("general")
             with clients_lock:
                 for c_conn, c_info in list(clients.items()):
                     if c_info.get("channel_id") == ch_id:
                         c_info["channel_id"] = general[0] if general else None
+                    if notify_ids is not None and c_info.get("user_id") not in notify_ids:
+                        continue
                     try:
-                        _event(c_conn, c_info["transport_key"], "CHANNEL_DELETED", {"id": ch_id, "name": ch_name})
+                        _event(c_conn, c_info, "CHANNEL_DELETED", {"id": ch_id, "name": ch_name})
                     except Exception:
                         pass
             logger.info(f"{pseudo} a supprimé '{ch_name}'")
@@ -343,23 +413,32 @@ def _handle_statement(conn, info: dict, payload: bytes):
             duration  = int(d["duration"]) if str(d.get("duration", "")).isdigit() else 0
 
             data.remove_member(ch[0], target_id)
+            data.ban_member(ch[0], target_id, int(time.time()) + duration if duration > 0 else None)
             if duration > 0:
-                temp_kicks[ch[0]][target_id] = time.time() + duration
-                msg = f"Vous avez été kické du canal '#{ch_name}' pour {duration} secondes."
+                msg = f"Expulsé de #{ch_name} pour {duration} s"
             else:
-                msg = f"Vous avez été kické du canal '#{ch_name}' (permanent)."
+                msg = f"Expulsé définitivement de #{ch_name}"
 
             general = data.get_channel("general")
             with clients_lock:
                 victims = [(c, i) for c, i in clients.items() if i.get("user_id") == target_id]
             for c_conn, c_info in victims:
-                _event(c_conn, c_info["transport_key"], "KICKED", {"message": msg})
+                _event(c_conn, c_info, "KICKED", {"message": msg})
                 if general:
                     if not data.is_member(general[0], target_id):
                         data.add_member(general[0], target_id)
                     _enter_channel(c_conn, c_info, general[0])
-            _event(conn, info["transport_key"], "KICK_SUCCESS", {"target": target, "duration": duration})
+            _event(conn, info, "KICK_SUCCESS", {"target": target, "duration": duration})
             logger.info(f"{pseudo} a kické '{target}' de '#{ch_name}' ({duration}s)")
+
+        elif name == "UPDATE_USER":
+            # Le client signale son activité : last_activity_at est mis à jour et les autres
+            # clients en sont informés (évènement USER_UPDATED). Au plus un envoi toutes les 30 s.
+            data.touch_user(pseudo)
+            if time.time() - info.get("last_user_update", 0) >= 30:
+                info["last_user_update"] = time.time()
+                _broadcast_event("USER_UPDATED", {"id": user_id, "name": pseudo,
+                                                  "last_activity_at": data.get_user_activity(pseudo)})
 
         else:
             logger.warning(f"Instruction inconnue : {name}")
@@ -386,6 +465,11 @@ def _handle_message(conn, info: dict, payload: bytes):
     if sender["id"] != user_id or sender["name"] != pseudo:
         logger.warning(f"Message rejeté : {pseudo} se fait passer pour {sender['name']}")
         return _error(conn, info, "Message rejeté : émetteur invalide")
+
+    # 1 bis) Horodatage plausible : sinon un message daté de 2099 resterait épinglé dans l'historique
+    if abs(int(time.time()) - ts) > MAX_CLOCK_DRIFT:
+        logger.warning(f"Message rejeté : horodatage hors délai ({pseudo})")
+        return _error(conn, info, "Message rejeté : horodatage invalide (horloge déréglée ?)")
 
     # 2) Somme de contrôle SHA-256 recalculée, puis signature RSA vérifiée avec la clé publique de l'émetteur
     if integrity["checksum"] != security.message_checksum(ts, sender, recipient, pl):
@@ -421,11 +505,11 @@ def _handle_message(conn, info: dict, payload: bytes):
                                   integrity["checksum"], integrity["signature"])
         member_ids = data.get_member_ids(ch[0])
         with clients_lock:
-            others = [(c, i["transport_key"]) for c, i in clients.items()
+            others = [(c, i) for c, i in clients.items()
                       if c is not conn and i.get("channel_id") == ch[0] and i["user_id"] in member_ids]
-        for c, key in others:
+        for c, i in others:
             try:
-                _send(c, key, ExchangeType.MESSAGE, to_forward)
+                _send(c, i, ExchangeType.MESSAGE, to_forward)
             except Exception:
                 pass
         logger.info(f"Message de {pseudo} sauvegardé et distribué dans #{ch[6]}")
@@ -439,7 +523,7 @@ def _handle_message(conn, info: dict, payload: bytes):
                                   pl["cipher_text_size"], pl["cipher_text_encrypted_key"],
                                   integrity["checksum"], integrity["signature"])
         _send_to_user(target[0], ExchangeType.MESSAGE, to_forward)   # livré tout de suite si connecté
-        _event(conn, info["transport_key"], "PM_SENT", {"target": target[1]})
+        _event(conn, info, "PM_SENT", {"target": target[1]})
         logger.info(f"Message privé de {pseudo} vers {target[1]} sauvegardé")
 
 
@@ -449,8 +533,10 @@ def handle(conn, addr):
     logger.info(f"Nouvelle connexion : {addr}")
     info = {}
     try:
-        pseudo, user_id, transport_key = _handshake(conn, addr)
-        info = {"pseudo": pseudo, "user_id": user_id, "transport_key": transport_key, "channel_id": None}
+        conn.settimeout(HANDSHAKE_TIMEOUT)   # une connexion muette ne bloque plus un thread indéfiniment
+        pseudo, user_id, cipher = _handshake(conn, addr)
+        conn.settimeout(None)
+        info = {"pseudo": pseudo, "user_id": user_id, "cipher": cipher, "channel_id": None}
         with clients_lock:
             clients[conn] = info
 
@@ -468,8 +554,11 @@ def handle(conn, addr):
             if not exchange:
                 break
             ex_type, raw = exchange
-            nonce, ct, tag = raw[:16], raw[16:-16], raw[-16:]
-            decrypted = security.aes_decrypt(ct, transport_key, (nonce, b"", tag), aad=bytes([ex_type]))
+            try:
+                decrypted = cipher.open(ex_type, raw)   # échoue si la trame est modifiée ou rejouée
+            except Exception:
+                logger.warning(f"Trame invalide ou rejouée de {pseudo} ({addr[0]}) : connexion coupée")
+                break
             logger.debug(f"Échange de type {ex_type} reçu de {pseudo} ({len(decrypted)} octets)")
             data.touch_user(pseudo)   # last_activity_at mis à jour à chaque échange
 
@@ -482,6 +571,10 @@ def handle(conn, addr):
 
     except PermissionError as e:
         logger.warning(str(e))
+    except TimeoutError:
+        logger.warning(f"{addr} : poignée de main non terminée en {HANDSHAKE_TIMEOUT} s, connexion coupée")
+    except ConnectionError as e:
+        logger.info(f"{addr} : {e}")
     except Exception as e:
         logger.error(f"Erreur avec {addr} : {e}")
     finally:
@@ -491,6 +584,8 @@ def handle(conn, addr):
             conn.close()
         except Exception:
             pass
+        with _conn_lock:
+            _conn_per_ip[addr[0]] = _conn_per_ip.get(addr[0], 1) - 1
         logger.info(f"Déconnexion : {info.get('pseudo', addr)}")
         if info.get("pseudo"):
             _broadcast_user_list()
@@ -500,9 +595,16 @@ def main():
     srv = network.start_tcp_server('0.0.0.0', 4000)
     logger.info("=" * 50)
     logger.info("  Serveur SecSyChat démarré sur le port 4000")
+    logger.info(f"  Empreinte de server.pub : {security.key_fingerprint(SERVER_PUB)}")
     logger.info("=" * 50)
     while True:
         conn, addr = srv.accept()
+        with _conn_lock:
+            if _conn_per_ip.get(addr[0], 0) >= MAX_CONN_PER_IP:
+                logger.warning(f"Trop de connexions depuis {addr[0]} : refusée")
+                conn.close()
+                continue
+            _conn_per_ip[addr[0]] = _conn_per_ip.get(addr[0], 0) + 1
         threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
 
 

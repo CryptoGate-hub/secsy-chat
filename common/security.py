@@ -1,4 +1,4 @@
-import secrets, hashlib, json
+import secrets, hashlib, json, os, threading
 from typing import Tuple
 from argon2 import PasswordHasher
 from Cryptodome.Cipher import AES, ChaCha20_Poly1305
@@ -43,7 +43,7 @@ def chacha20_decrypt(key: bytes, nonce: bytes, ct: bytes, tag: bytes) -> bytes:
     return ChaCha20_Poly1305.new(key=key, nonce=nonce).decrypt_and_verify(ct, tag)
 
 # --- Diffie-Hellman ---
-# Groupe standard RFC 3526 "Group 5" (1536 bits), reconnu et documenté publiquement.
+# Groupe standard RFC 3526 "Group 14" (2048 bits, "safe prime"), reconnu et documenté publiquement.
 # L'ancien P (256 bits, bricolé) était cassable par calcul de logarithme discret
 # avec du matériel grand public : trop court pour un échange de clé sérieux.
 P = int(
@@ -61,7 +61,7 @@ P = int(
 )
 G = 2
 
-def diffie_hellman_generate_public_parameters(bits: int = 256) -> Tuple[int, int]:
+def diffie_hellman_generate_public_parameters() -> Tuple[int, int]:
     return P, G
 
 def diffie_hellman_generate_private_key(p: int) -> int:
@@ -79,6 +79,67 @@ def diffie_hellman_compute_shared_secret(priv: int, peer_pub: int, p: int) -> in
 def diffie_hellman_derive_shared_key(shared_secret: int, key_length: int = 32) -> bytes:
     # Dérivation propre via SHA-256 (bien mieux que str()[:32])
     return hashlib.sha256(str(shared_secret).encode()).digest()[:key_length]
+
+# --- Chiffrement du transport : AES-GCM + compteur anti-rejeu ---
+class TransportCipher:
+    """Chiffre / déchiffre les échanges d'une session (clé de transport issue du Diffie-Hellman).
+
+    Anti-rejeu : chaque sens (client -> serveur, serveur -> client) a son propre compteur.
+    Le compteur n'est PAS envoyé sur le réseau : TCP garantit l'ordre, donc les deux côtés
+    savent quel numéro attendre. Il est mis dans la donnée associée (AAD) d'AES-GCM avec le
+    type d'échange et le sens. Une trame rejouée (ou renvoyée dans l'autre sens) porte un
+    ancien numéro : la vérification GCM échoue et la connexion est coupée.
+    """
+    def __init__(self, key: bytes, is_server: bool):
+        self.key       = key
+        self.send_dir  = b"S" if is_server else b"C"
+        self.recv_dir  = b"C" if is_server else b"S"
+        self.send_seq  = 0
+        self.recv_seq  = 0
+        self.lock      = threading.Lock()   # plusieurs threads peuvent envoyer sur la même connexion
+
+    @staticmethod
+    def _aad(ex_type: int, direction: bytes, seq: int) -> bytes:
+        return bytes([ex_type]) + direction + seq.to_bytes(8, "big")
+
+    def seal(self, ex_type: int, payload: bytes) -> bytes:
+        """À appeler en tenant self.lock, juste avant l'envoi (l'ordre des numéros = l'ordre d'envoi)."""
+        nonce, _, ct, tag = aes_encrypt(payload, self.key, self._aad(ex_type, self.send_dir, self.send_seq))
+        self.send_seq += 1
+        return nonce + ct + tag
+
+    def open(self, ex_type: int, frame: bytes) -> bytes:
+        """Déchiffre une trame reçue ; lève une exception si elle est modifiée, rejouée ou hors d'ordre."""
+        nonce, ct, tag = frame[:16], frame[16:-16], frame[-16:]
+        data = aes_decrypt(ct, self.key, (nonce, b"", tag), self._aad(ex_type, self.recv_dir, self.recv_seq))
+        self.recv_seq += 1
+        return data
+
+
+# --- Identité du serveur (authentifie le Diffie-Hellman) ---
+def load_or_create_rsa_key(path: str) -> bytes:
+    """Charge une clé privée RSA depuis un fichier, ou la crée (clé d'identité du serveur : server.key)."""
+    if os.path.exists(path):
+        return open(path, "rb").read()
+    priv, _ = generate_rsa_keypair()
+    with open(path, "wb") as f:
+        f.write(priv)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return priv
+
+def key_fingerprint(pub_pem: bytes) -> str:
+    """Empreinte courte d'une clé publique (à comparer à l'œil, comme pour SSH)."""
+    h = hashlib.sha256(RSA.import_key(pub_pem).publickey().export_key()).hexdigest()[:32]
+    return ":".join(h[i:i + 4] for i in range(0, len(h), 4))
+
+def dh_signed_data(server_dh_pub: int, client_dh_pub: int) -> bytes:
+    """Ce que le serveur signe : les DEUX clés publiques Diffie-Hellman de la session.
+    Une signature d'une ancienne session ne peut donc pas être réutilisée."""
+    return f"SECSY-DH|{server_dh_pub}|{client_dh_pub}".encode()
+
 
 # --- RSA (paires de clés E2EE + signature) ---
 def generate_rsa_keypair() -> Tuple[bytes, bytes]:
