@@ -15,7 +15,7 @@ from common import network, security
 from common.exchange import ExchangeType
 from common.message import parse_message
 from common.event import parse_event
-from secsychat_tui import SecsyChatTui, TuiMessage, TuiMessageType, TuiMessageSenderType
+from secsychat_tui import SecsyChatTui, TuiMessage, TuiMessageType
 
 # Assistant IA (bonus, hors énoncé) — isolé dans son propre fichier.
 # Voir ai_assistant.py pour l'explication complète (notamment la vulnérabilité

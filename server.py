@@ -26,6 +26,10 @@ data.db_conn = db_conn
 MAX_CLOCK_DRIFT = 300             # 5 minutes (énoncé 2.2.2) : écart toléré pour un timestamp signé
 HANDSHAKE_TIMEOUT = 15            # secondes pour terminer la connexion, sinon on coupe
 MAX_CONN_PER_IP   = 10            # connexions simultanées maximum depuis une même adresse IP
+MAX_CIPHER_LEN   = 16 * 1024     # taille maximale du texte chiffré (base64) d'un message : évite qu'un message
+                                 # géant rende l'historique d'un canal impossible à recevoir pour les autres
+MAX_KEY_LEN      = 1024          # taille maximale de la clé chiffrée d'un message (RSA-2048 : ~344 caractères)
+MSG_BURST, MSG_WINDOW = 10, 10   # au plus 10 messages toutes les 10 secondes par connexion
 
 # Identité du serveur : sa clé privée (server.key) signe chaque Diffie-Hellman.
 # server.pub est la clé publique à donner aux clients (ils la vérifient avant d'envoyer
@@ -37,7 +41,7 @@ with open("server.pub", "wb") as _f:
 
 # Limitation des essais de mot de passe : après 5 échecs sur un pseudo (ou 20 depuis une même IP,
 # tous pseudos confondus), attente de 30 s, puis 60 s, 120 s... (15 min maximum)
-MAX_FAILED = {"user": 5, "ip": 20}
+MAX_FAILED = {"user": 5, "ip": 20, "chan": 5}   # "chan" : essais de mot de passe d'un canal privé, par utilisateur
 BASE_DELAY, MAX_DELAY = 30, 900
 _failed      = {}                 # ("user", pseudo) ou ("ip", adresse) -> [nombre d'échecs, bloqué jusqu'à]
 _failed_lock = threading.Lock()
@@ -349,9 +353,16 @@ def _handle_statement(conn, info: dict, payload: bytes):
 
             if not data.is_member(ch_id, user_id):
                 # La clé secrète n'est nécessaire que pour devenir membre une première fois
-                if ch[1] and not security.argon2_verify_password(ch_pass, ch[1]):
-                    logger.warning(f"{pseudo} : mauvais secret pour le canal {ch_id}")
-                    return _error(conn, info, "Mot de passe incorrect")
+                if ch[1]:
+                    chan_key = [("chan", user_id)]
+                    wait = _auth_blocked(chan_key)
+                    if wait:
+                        return _error(conn, info, f"Trop d'essais : réessaie dans {wait} s")
+                    if not security.argon2_verify_password(ch_pass, ch[1]):
+                        _auth_failed(chan_key)
+                        logger.warning(f"{pseudo} : mauvais secret pour le canal {ch_id}")
+                        return _error(conn, info, "Mot de passe incorrect")
+                    _auth_succeeded(chan_key)
                 data.add_member(ch_id, user_id)
             _enter_channel(conn, info, ch_id)
 
@@ -421,7 +432,8 @@ def _handle_statement(conn, info: dict, payload: bytes):
 
             general = data.get_channel("general")
             with clients_lock:
-                victims = [(c, i) for c, i in clients.items() if i.get("user_id") == target_id]
+                victims = [(c, i) for c, i in clients.items()
+                           if i.get("user_id") == target_id and i.get("channel_id") == ch[0]]
             for c_conn, c_info in victims:
                 _event(c_conn, c_info, "KICKED", {"message": msg})
                 if general:
@@ -459,6 +471,17 @@ def _handle_message(conn, info: dict, payload: bytes):
 
     sender, recipient, pl, integrity = msg["sender"], msg["recipient"], msg["payload"], msg["integrity"]
     ts = msg["timestamp"]
+
+    # 0) Taille et cadence : un message géant (ou un flot de messages) ne doit pas pouvoir bloquer les autres
+    if len(pl["cipher_text"]) > MAX_CIPHER_LEN or len(pl["cipher_text_encrypted_key"]) > MAX_KEY_LEN:
+        logger.warning(f"Message rejeté : trop volumineux ({pseudo})")
+        return _error(conn, info, "Message trop long")
+    now    = time.time()
+    recent = [t for t in info.get("msg_times", []) if now - t < MSG_WINDOW]
+    if len(recent) >= MSG_BURST:
+        logger.warning(f"Message rejeté : trop de messages ({pseudo})")
+        return _error(conn, info, "Trop de messages : ralentis un peu")
+    info["msg_times"] = recent + [now]
 
     # 1) L'émetteur annoncé doit être l'utilisateur authentifié sur cette connexion
     #    (sinon un utilisateur pourrait signer un message "de la part de" quelqu'un d'autre)
