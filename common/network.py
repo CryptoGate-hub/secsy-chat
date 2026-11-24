@@ -1,4 +1,4 @@
-import socket, struct, time
+import socket, time
 
 
 def start_tcp_server(ip: str, port: int) -> socket.socket:
