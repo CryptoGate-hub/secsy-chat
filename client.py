@@ -218,6 +218,41 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
             ai_warning_shown["done"] = True
         return ask_ai(question=question, fichiers=fichiers, mode=mode)
 
+    # ── Affichage des listes (utilisateurs / canaux) ─────────────────────────────
+    # La TUI recrée toute la liste quand on lui envoie UPDATED_*_EVENT, mais elle supprime les
+    # anciens éléments de façon asynchrone avant de recréer les mêmes identifiants : si deux mises
+    # à jour se suivent de près, elle plante (DuplicateIds). On lui envoie donc uniquement la
+    # DIFFÉRENCE (un ajout ou un retrait à la fois), après avoir mémorisé ce qu'elle affiche déjà.
+    ui_lock     = threading.Lock()
+    ui_users    = set()     # utilisateurs déjà affichés
+    ui_channels = set()     # canaux déjà affichés
+
+    def _ui_sync(shown: set, wanted: list, add_type, remove_type):
+        """Aligne l'affichage sur la liste reçue du serveur, en n'envoyant que ce qui change."""
+        with ui_lock:
+            removed = shown - set(wanted)
+            for name in sorted(removed):
+                q_in.put(TuiMessage(t_time.time(), "", name, type=remove_type))
+                shown.discard(name)
+            if removed:
+                t_time.sleep(0.15)   # laisse la TUI finir de retirer avant de réutiliser un identifiant
+            for name in wanted:
+                if name not in shown:
+                    q_in.put(TuiMessage(t_time.time(), "", name, type=add_type))
+                    shown.add(name)
+
+    def _ui_add(shown: set, name: str, add_type):
+        with ui_lock:
+            if name not in shown:
+                q_in.put(TuiMessage(t_time.time(), "", name, type=add_type))
+                shown.add(name)
+
+    def _ui_remove(shown: set, name: str, remove_type):
+        with ui_lock:
+            if name in shown:
+                q_in.put(TuiMessage(t_time.time(), "", name, type=remove_type))
+                shown.discard(name)
+
     def _show_incoming(msg: dict, live: bool):
         """Vérifie (destinataire, checksum, signature), déchiffre et affiche un message de canal ou privé."""
         sender_name = msg["sender"]["name"]
@@ -260,15 +295,14 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
                         channels = d.get("channels", [])
                         clean_channels = [c.strip().replace("# ", "").replace("🔒 ", "").strip()
                                           for c in channels if isinstance(c, str) and c.strip()]
-                        q_in.put(TuiMessage(t_time.time(), "", ";".join(clean_channels),
-                                            type=TuiMessageType.UPDATED_CHANNELS_EVENT))
+                        _ui_sync(ui_channels, clean_channels,
+                                 TuiMessageType.NEW_CHANNEL_EVENT, TuiMessageType.DELETED_CHANNEL_EVENT)
 
                     elif name == "CHANNEL_CREATED":
                         new_ch = d.get("name", "").strip()
                         if new_ch:
                             clean_name = new_ch.replace("# ", "").replace("🔒 ", "").strip()
-                            q_in.put(TuiMessage(t_time.time(), "", clean_name,
-                                                type=TuiMessageType.NEW_CHANNEL_EVENT))
+                            _ui_add(ui_channels, clean_name, TuiMessageType.NEW_CHANNEL_EVENT)
 
                     elif name == "CHANNEL_JOINED":
                         current_channel["id"]   = d["id"]
@@ -318,8 +352,7 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
                     elif name == "CHANNEL_DELETED":
                         deleted_name = d.get("name", "")
                         q_in.put(TuiMessage(t_time.time(), "Système", f"🗑️ Canal '{deleted_name}' supprimé"))
-                        q_in.put(TuiMessage(t_time.time(), "", deleted_name,
-                                            type=TuiMessageType.DELETED_CHANNEL_EVENT))
+                        _ui_remove(ui_channels, deleted_name, TuiMessageType.DELETED_CHANNEL_EVENT)
                         if current_channel["id"] == d.get("id"):
                             # Le canal sélectionné n'existe plus : on retourne dans #general
                             current_channel["priv"] = current_channel["pub"] = None
@@ -340,14 +373,8 @@ def network_worker(q_in: Queue, q_out: Queue, sock, pseudo: str, password: str, 
                     elif name == "UPDATED_USERS":
                         users = d.get("users", [])
                         clean_users = [u.strip() for u in users if isinstance(u, str) and u.strip()]
-                        users_str = ";".join(clean_users)
-
-                        # Contournement du bug TUI (uniquement pour les users)
-                        q_in.put(TuiMessage(t_time.time(), "", "",
-                                            type=TuiMessageType.UPDATED_USERS_EVENT))
-                        if users_str:
-                            q_in.put(TuiMessage(t_time.time(), "", users_str,
-                                                type=TuiMessageType.UPDATED_USERS_EVENT))
+                        _ui_sync(ui_users, clean_users,
+                                 TuiMessageType.CONNECTED_USER_EVENT, TuiMessageType.DISCONNECTED_USER_EVENT)
 
                 elif ex_type == ExchangeType.MESSAGE.value:
                     # Message d'un autre utilisateur (canal ou privé), chiffré E2EE

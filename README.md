@@ -9,7 +9,9 @@
 </p>
 
 > Projet intégratif **UE14 – Intégration de la sécurité 1** (HELMo, Bachelier en informatique, orientation Sécurité des systèmes).
-> Le projet a ensuite fait l'objet d'un **audit de sécurité** : les failles trouvées et corrigées sont documentées dans [docs/AUDIT_SECURITE.md](docs/AUDIT_SECURITE.md).
+> **Équipe** : Youssef Benchakroun (chef de projet), Abdul Rahman Alahmad, Nouh Fache.
+> **Audit de sécurité et corrections** menés ensuite par Youssef Benchakroun.
+> Le projet a fait l'objet d'un **audit de sécurité** : les failles trouvées et corrigées sont documentées dans [docs/AUDIT_SECURITE.md](docs/AUDIT_SECURITE.md).
 
 ## Ce que fait le projet
 
