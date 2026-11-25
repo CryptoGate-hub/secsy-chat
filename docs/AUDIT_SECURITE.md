@@ -19,10 +19,13 @@ tiennent (rejeu refusé, Diffie-Hellman signé, verrouillage des essais). Les po
 | 3 | **Kick qui déplace aussi les sessions d'un autre canal** | Bob dans `#dev` kické de `#room` : renvoyé de force dans `#general` | Seules les sessions présentes dans le canal concerné sont déplacées | `server.py` |
 | 4 | **`/ia2` pouvait envoyer une clé privée à Google** | `/ia2 alice.key` lisait le fichier et l'envoyait à Gemini | Les fichiers `.key`, `.pem`, `.db` et `.log` sont refusés | `ai_assistant.py` |
 | 5 | Nettoyage | Imports inutilisés, `**` affiché tel quel dans la TUI | Retirés | `client.py`, `common/network.py`, `ai_assistant.py` |
+| 6 | **Création de canaux et de comptes sans limite** | 25 canaux créés d'affilée en 8 s (une paire RSA-2048 générée par canal), aucune limite | 5 canaux par minute et par utilisateur ; 10 comptes par adresse IP en 10 minutes | `server.py` |
+| 7 | **Journal du serveur sans rotation** | `server.log` grossit sans fin (niveau DEBUG) | Rotation à 1 Mo, 3 anciens fichiers conservés | `server.py`, `.gitignore` |
 
 **Limites assumées, documentées**
 - Le verrouillage des essais de connexion permet à un tiers de bloquer temporairement un pseudo (compromis classique).
 - Les clés publiques des autres utilisateurs ne sont pas mémorisées d'une session à l'autre côté client.
+- Pas de confidentialité persistante pour les messages : la clé `<pseudo>.key` (stockée en clair) permet de déchiffrer tous les messages privés enregistrés auparavant.
 - La fin de la poignée de main (clé publique RSA, timestamp signé, `AUTH_OK`) circule non chiffrée : rien de secret, mais ce n'est pas aligné sur le reste du protocole.
 
 ---

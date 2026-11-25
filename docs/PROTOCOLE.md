@@ -414,7 +414,9 @@ La commande `/ia2` permet d'analyser des fichiers locaux (`.txt`, `.pdf`, `.docx
 
 ## Tests
 
-Pour tester l'ensemble des fonctionnalités :
+Tests de sécurité automatiques : `python tests/test_securite.py` (voir le README).
+
+Pour tester l'ensemble des fonctionnalités à la main :
 
 1. Lancer le serveur : `python server.py`
 2. Ouvrir 2 ou 3 terminaux et lancer des clients avec des pseudos différents.
